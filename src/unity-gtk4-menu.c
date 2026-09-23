@@ -96,6 +96,14 @@ DECL(GtkApplication *, gtk_window_get_application, (GtkWindow *));
 DECL(GMenuModel *, gtk_application_get_menubar, (GtkApplication *));
 DECL(void, gtk_application_set_menubar, (GtkApplication *, GMenuModel *));
 DECL(GMenu *, g_menu_new, (void));
+DECL(gint, g_menu_model_get_n_items, (GMenuModel *));
+DECL(GMenuModel *, g_menu_model_get_item_link, (GMenuModel *, gint, const gchar *));
+DECL(GMenuItem *, g_menu_item_new_from_model, (GMenuModel *, gint));
+DECL(void, g_menu_item_set_link, (GMenuItem *, const gchar *, GMenuModel *));
+DECL(void, g_menu_append_item, (GMenu *, GMenuItem *));
+DECL(GVariant *, g_menu_model_get_item_attribute_value,
+     (GMenuModel *, gint, const gchar *, const GVariantType *));
+DECL(void, g_variant_unref, (GVariant *));
 DECL(void, g_menu_append_submenu, (GMenu *, const gchar *, GMenuModel *));
 DECL(const gchar *, g_get_application_name, (void));
 DECL(gchar *, g_strdup, (const gchar *));
@@ -147,6 +155,13 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(gtk, gtk_application_set_menubar);
 
 	RESOLVE(gio, g_menu_new);
+	RESOLVE(gio, g_menu_model_get_n_items);
+	RESOLVE(gio, g_menu_model_get_item_link);
+	RESOLVE(gio, g_menu_item_new_from_model);
+	RESOLVE(gio, g_menu_item_set_link);
+	RESOLVE(gio, g_menu_append_item);
+	RESOLVE(gio, g_menu_model_get_item_attribute_value);
+	RESOLVE(glib, g_variant_unref);
 	RESOLVE(gio, g_menu_append_submenu);
 	RESOLVE(gio, g_application_get_application_id);
 	RESOLVE(gio, g_desktop_app_info_new);
@@ -284,6 +299,69 @@ static gchar *menu_label(GtkApplication *app)
 	return p_g_strdup(fallback ? fallback : "Menu");
 }
 
+/* ---- cleaning the model ------------------------------------------------- */
+
+/*
+ * A GtkPopoverMenu can embed widgets: an item carrying a "custom" attribute is
+ * a slot where the application puts a live widget - yelp's zoom controls, for
+ * instance. A widget cannot cross D-Bus, so exported as-is the slot arrives in
+ * the global menu as an empty, nameless row.
+ *
+ * Build a copy of the model with those items removed, and with any section or
+ * submenu left empty by the removal dropped too, so no blank rows or empty
+ * separators remain. The copy is static: it does not follow later changes to
+ * the original, which is acceptable for header bar menus, which are built once.
+ */
+static int has_attribute(GMenuModel *model, gint i, const char *name)
+{
+	GVariant *v = p_g_menu_model_get_item_attribute_value(model, i, name, NULL);
+	if (v == NULL)
+		return 0;
+	p_g_variant_unref(v);
+	return 1;
+}
+
+static GMenuModel *clean_model(GMenuModel *model, int depth, int *dropped)
+{
+	GMenu *out = p_g_menu_new();
+	gint n = p_g_menu_model_get_n_items(model);
+
+	for (gint i = 0; i < n; i++) {
+		if (has_attribute(model, i, "custom")) {
+			(*dropped)++;
+			continue;
+		}
+
+		GMenuItem *item = p_g_menu_item_new_from_model(model, i);
+		int keep = 1;
+
+		const char *links[] = { "section", "submenu" };
+		for (int l = 0; l < 2 && depth < 16; l++) {
+			GMenuModel *child =
+				p_g_menu_model_get_item_link(model, i, links[l]);
+			if (child == NULL)
+				continue;
+
+			GMenuModel *cleaned = clean_model(child, depth + 1, dropped);
+			p_g_object_unref(child);
+
+			if (p_g_menu_model_get_n_items(cleaned) == 0)
+				keep = 0;
+			else
+				p_g_menu_item_set_link(item, links[l], cleaned);
+			p_g_object_unref(cleaned);
+		}
+
+		if (keep)
+			p_g_menu_append_item(out, item);
+		else
+			(*dropped)++;
+		p_g_object_unref(item);
+	}
+
+	return (GMenuModel *)out;
+}
+
 /* ---- attaching ----------------------------------------------------------- */
 
 static void attach_menubar(GtkWindow *window)
@@ -308,9 +386,15 @@ static void attach_menubar(GtkWindow *window)
 		return;
 	}
 
+	int dropped = 0;
+	GMenuModel *cleaned = clean_model(model, 0, &dropped);
+	if (dropped > 0)
+		note("dropped %d item(s) that cannot cross D-Bus", dropped);
+
 	gchar *label = menu_label(app);
 	GMenu *menubar = p_g_menu_new();
-	p_g_menu_append_submenu(menubar, label, model);
+	p_g_menu_append_submenu(menubar, label, cleaned);
+	p_g_object_unref(cleaned);
 	p_gtk_application_set_menubar(app, (GMenuModel *)menubar);
 	p_g_object_unref(menubar);
 	note("menubar attached, labelled \"%s\"", label);

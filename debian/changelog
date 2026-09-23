@@ -1,3 +1,12 @@
+unity-gtk4-menu (0.3) resolute; urgency=medium
+
+  * Drop menu items that carry a "custom" attribute before exporting, along
+    with any section left empty by the removal. They are slots for live
+    widgets inside a GtkPopoverMenu, which cannot cross D-Bus, and arrived in
+    the global menu as blank rows - yelp's zoom controls did exactly that.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Wed, 23 Sep 2026 11:30:00 +0000
+
 unity-gtk4-menu (0.2) resolute; urgency=medium
 
   * Resolve every GTK and GLib symbol with dlsym at runtime instead of linking
