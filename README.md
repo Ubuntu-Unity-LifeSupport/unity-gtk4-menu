@@ -34,11 +34,40 @@ file of the same name:
     # one user
     touch ~/.config/environment.d/60-unity-gtk4-menu.conf
 
+## Actions the window does not export
+
+The global menu can only activate what the application exports over D-Bus: the
+application's actions (`app.`) and a `GtkApplicationWindow`'s own action map
+(`win.`). Header bar menus may also name actions installed on a widget class
+with `gtk_widget_class_install_action()` - yelp's "About Help" is one. Inside
+the application the popover resolves them through the widget's action muxer;
+over D-Bus nobody can, so they used to arrive greyed out.
+
+For each such item the exported copy of the menu points at a stand-in added to
+the window's action map, named `unity-gtk4-menu-<original name>`, which
+activates the original from the menu button. Known limits:
+
+- A stand-in is always shown enabled. GTK has no public getter for a class
+  action's enabled state; activating a disabled one does nothing, as it would
+  in the application.
+- Property actions (`gtk_widget_class_install_property_action()`) are left
+  alone: they carry state a plain stand-in cannot mirror.
+- Actions with a prefix other than `app.` or `win.` usually come from a group
+  inserted on a sub-widget with `gtk_widget_insert_action_group()`, which
+  public API cannot enumerate. They are left alone too.
+
+The debug log names every action in each of these cases, so a new application
+shows at once which one it hits.
+
 ## Testing without installing
 
     make
-    LD_PRELOAD=./libunity-gtk4-menu.so.0 UNITY_GTK4_SHIM_DEBUG=1 \
-      UNITY_GTK4_SHIM_LOG=/tmp/shim.log some-gtk4-application
+    LD_PRELOAD=./libunity-gtk4-menu.so.0 UNITY_GTK4_MENU_DEBUG=1 \
+      UNITY_GTK4_MENU_LOG=/tmp/shim.log some-gtk4-application
 
-`UNITY_GTK4_SHIM_LABEL=app|generic` overrides the setting.
-`UNITY_GTK4_SHIM_FORCE=1` skips the check that the session is Unity.
+`UNITY_GTK4_MENU_LABEL=app|generic` overrides the setting.
+`UNITY_GTK4_MENU_FORCE=1` skips the check that the session is Unity.
+
+`tests/classtest.c` is a minimal application with one item of each kind above;
+every activation prints a line, so a test can activate the exported actions
+with `gdbus call ... org.gtk.Actions.Activate` and read the result.

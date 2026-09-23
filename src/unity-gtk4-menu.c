@@ -118,6 +118,24 @@ DECL(GSettingsSchema *, g_settings_schema_source_lookup,
 DECL(void, g_settings_schema_unref, (GSettingsSchema *));
 DECL(GSettings *, g_settings_new, (const gchar *));
 DECL(gboolean, g_settings_get_boolean, (GSettings *, const gchar *));
+DECL(GtkWidget *, gtk_widget_get_parent, (GtkWidget *));
+DECL(gboolean, gtk_widget_class_query_action,
+     (GtkWidgetClass *, guint, GType *, const char **, const GVariantType **,
+      const char **));
+DECL(gboolean, gtk_widget_activate_action_variant,
+     (GtkWidget *, const char *, GVariant *));
+DECL(GSimpleAction *, g_simple_action_new, (const gchar *, const GVariantType *));
+DECL(void, g_action_map_add_action, (GActionMap *, GAction *));
+DECL(GAction *, g_action_map_lookup_action, (GActionMap *, const gchar *));
+DECL(gulong, g_signal_connect_data,
+     (gpointer, const gchar *, GCallback, gpointer, GClosureNotify,
+      GConnectFlags));
+DECL(void, g_object_add_weak_pointer, (GObject *, gpointer *));
+DECL(void, g_object_remove_weak_pointer, (GObject *, gpointer *));
+DECL(const gchar *, g_variant_get_string, (GVariant *, gsize *));
+DECL(GVariant *, g_variant_new_string, (const gchar *));
+DECL(void, g_menu_item_set_attribute_value,
+     (GMenuItem *, const gchar *, GVariant *));
 
 static GType type_window, type_app_window, type_menu_button;
 static GType type_popover_menu, type_popover_menu_bar;
@@ -172,6 +190,19 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(gio, g_settings_new);
 	RESOLVE(gio, g_settings_get_boolean);
 
+	RESOLVE(gtk, gtk_widget_get_parent);
+	RESOLVE(gtk, gtk_widget_class_query_action);
+	RESOLVE(gtk, gtk_widget_activate_action_variant);
+	RESOLVE(gio, g_simple_action_new);
+	RESOLVE(gio, g_action_map_add_action);
+	RESOLVE(gio, g_action_map_lookup_action);
+	RESOLVE(gio, g_menu_item_set_attribute_value);
+	RESOLVE(gobj, g_signal_connect_data);
+	RESOLVE(gobj, g_object_add_weak_pointer);
+	RESOLVE(gobj, g_object_remove_weak_pointer);
+	RESOLVE(glib, g_variant_get_string);
+	RESOLVE(glib, g_variant_new_string);
+
 	RESOLVE(glib, g_get_application_name);
 	RESOLVE(glib, g_strdup);
 	RESOLVE(glib, g_strconcat);
@@ -194,7 +225,11 @@ static int is_a(void *instance, GType type)
 
 /* ---- finding the menu ---------------------------------------------------- */
 
-static GMenuModel *find_menu_model(GtkWidget *widget, int depth)
+/* On success *owner is the widget the menu hangs off - the menu button or the
+   popover menu bar. Its actions resolve the way the application's own popover
+   resolves them, which is what activating a widget-scoped action needs. */
+static GMenuModel *find_menu_model(GtkWidget *widget, int depth,
+				   GtkWidget **owner)
 {
 	if (widget == NULL || depth > 32)
 		return NULL;
@@ -205,6 +240,7 @@ static GMenuModel *find_menu_model(GtkWidget *widget, int depth)
 
 		if (model != NULL) {
 			note("menu button with a model at depth %d", depth);
+			*owner = widget;
 			return model;
 		}
 
@@ -220,6 +256,7 @@ static GMenuModel *find_menu_model(GtkWidget *widget, int depth)
 			if (model != NULL) {
 				note("popover menu behind a button at depth %d",
 				     depth);
+				*owner = widget;
 				return model;
 			}
 		}
@@ -230,13 +267,14 @@ static GMenuModel *find_menu_model(GtkWidget *widget, int depth)
 			(GtkPopoverMenuBar *)widget);
 		if (model != NULL) {
 			note("popover menu bar at depth %d", depth);
+			*owner = widget;
 			return model;
 		}
 	}
 
 	for (GtkWidget *child = p_gtk_widget_get_first_child(widget);
 	     child != NULL; child = p_gtk_widget_get_next_sibling(child)) {
-		GMenuModel *model = find_menu_model(child, depth + 1);
+		GMenuModel *model = find_menu_model(child, depth + 1, owner);
 		if (model != NULL)
 			return model;
 	}
@@ -299,6 +337,161 @@ static gchar *menu_label(GtkApplication *app)
 	return p_g_strdup(fallback ? fallback : "Menu");
 }
 
+/* ---- widget-scoped actions --------------------------------------------- */
+
+/*
+ * The global menu can only activate what the application exports over D-Bus:
+ * the application's action group ("app.") and a GtkApplicationWindow's own
+ * action map ("win."). A header bar menu may also name actions installed on a
+ * widget class with gtk_widget_class_install_action() - yelp's "About Help" is
+ * win.yelp-show-about-dialog, a class action of YelpWindow, not an entry in the
+ * window's action map. Inside the application the popover finds it through the
+ * widget's action muxer; over D-Bus nobody can, so Unity showed it greyed out.
+ *
+ * For each such item the exported copy of the model points at a stand-in added
+ * to the window's action map, and the stand-in activates the original name
+ * from the menu's owner widget - the same lookup the popover itself performs.
+ * Only class actions positively found on the owner or its ancestors get one;
+ * a property action (gtk_widget_class_install_property_action) carries state
+ * a plain stand-in cannot mirror, so it is left alone and logged. So are names
+ * with a prefix other than app. or win., which usually come from a group
+ * inserted on a sub-widget and cannot be enumerated through public API.
+ *
+ * The stand-in is always enabled: GTK has no public getter for a class
+ * action's enabled state. Activating a disabled one does nothing, as in the
+ * application.
+ */
+#define PROXY_PREFIX "unity-gtk4-menu-"
+
+struct proxy {
+	GtkWidget *owner; /* weak */
+	gchar *name;
+};
+
+static void proxy_activate(GSimpleAction *action, GVariant *parameter,
+			   gpointer data)
+{
+	struct proxy *proxy = data;
+
+	if (proxy->owner == NULL)
+		return;
+
+	if (!p_gtk_widget_activate_action_variant(proxy->owner, proxy->name,
+						  parameter))
+		note("%s did not resolve from its owner", proxy->name);
+}
+
+static void proxy_free(gpointer data, GClosure *closure)
+{
+	struct proxy *proxy = data;
+
+	if (proxy->owner != NULL)
+		p_g_object_remove_weak_pointer((GObject *)proxy->owner,
+					       (gpointer *)&proxy->owner);
+	p_g_free(proxy->name);
+	free(proxy);
+}
+
+/* Returns 1 for a stateless class action on @widget or an ancestor. */
+static int find_class_action(GtkWidget *widget, const char *name,
+			     const GVariantType **parameter_type)
+{
+	for (; widget != NULL; widget = p_gtk_widget_get_parent(widget)) {
+		GtkWidgetClass *klass =
+			(GtkWidgetClass *)((GTypeInstance *)widget)->g_class;
+		GType owner_type;
+		const char *action_name, *property_name;
+		const GVariantType *ptype;
+
+		for (guint i = 0; p_gtk_widget_class_query_action(
+			     klass, i, &owner_type, &action_name, &ptype,
+			     &property_name);
+		     i++) {
+			if (strcmp(action_name, name) != 0)
+				continue;
+			if (property_name != NULL) {
+				note("%s is a property action, not proxied",
+				     name);
+				return 0;
+			}
+			*parameter_type = ptype;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* The name the exported item should use for @name: a stand-in in @map when
+   @name is a class action reachable from @owner, otherwise NULL - keep it. */
+static gchar *proxy_for(const char *name, GtkWidget *owner, GActionMap *map)
+{
+	const GVariantType *ptype = NULL;
+
+	if (!find_class_action(owner, name, &ptype)) {
+		if (strncmp(name, "app.", 4) != 0 &&
+		    strncmp(name, "win.", 4) != 0)
+			note("%s has a prefix the global menu cannot reach",
+			     name);
+		return NULL;
+	}
+
+	/* No dots: the whole name after "win." is one action name, and a dot
+	   inside it would only invite a parser to split it. */
+	gchar *local = p_g_strconcat(PROXY_PREFIX, name, NULL);
+	for (gchar *c = local; *c; c++)
+		if (*c == '.')
+			*c = '-';
+
+	if (p_g_action_map_lookup_action(map, local) == NULL) {
+		struct proxy *proxy = calloc(1, sizeof *proxy);
+		proxy->owner = owner;
+		proxy->name = p_g_strdup(name);
+		p_g_object_add_weak_pointer((GObject *)owner,
+					    (gpointer *)&proxy->owner);
+
+		GSimpleAction *action = p_g_simple_action_new(local, ptype);
+		p_g_signal_connect_data(action, "activate",
+					(GCallback)proxy_activate, proxy,
+					proxy_free, 0);
+		p_g_action_map_add_action(map, (GAction *)action);
+		p_g_object_unref(action);
+		note("%s proxied as win.%s", name, local);
+	}
+
+	gchar *exported = p_g_strconcat("win.", local, NULL);
+	p_g_free(local);
+	return exported;
+}
+
+/* What clean_model needs to proxy actions: the widget the menu came from and
+   the window's action map, or NULL map when the window exports none. */
+struct scope {
+	GtkWidget *owner;
+	GActionMap *map;
+	int dropped;
+};
+
+static void proxy_item(GMenuModel *model, gint i, GMenuItem *item,
+		       struct scope *scope)
+{
+	if (scope->map == NULL)
+		return;
+
+	GVariant *v = p_g_menu_model_get_item_attribute_value(
+		model, i, "action", G_VARIANT_TYPE_STRING);
+	if (v == NULL)
+		return;
+
+	gchar *exported = proxy_for(p_g_variant_get_string(v, NULL),
+				    scope->owner, scope->map);
+	if (exported != NULL) {
+		p_g_menu_item_set_attribute_value(
+			item, "action", p_g_variant_new_string(exported));
+		p_g_free(exported);
+	}
+	p_g_variant_unref(v);
+}
+
 /* ---- cleaning the model ------------------------------------------------- */
 
 /*
@@ -321,19 +514,22 @@ static int has_attribute(GMenuModel *model, gint i, const char *name)
 	return 1;
 }
 
-static GMenuModel *clean_model(GMenuModel *model, int depth, int *dropped)
+static GMenuModel *clean_model(GMenuModel *model, int depth,
+			       struct scope *scope)
 {
 	GMenu *out = p_g_menu_new();
 	gint n = p_g_menu_model_get_n_items(model);
 
 	for (gint i = 0; i < n; i++) {
 		if (has_attribute(model, i, "custom")) {
-			(*dropped)++;
+			scope->dropped++;
 			continue;
 		}
 
 		GMenuItem *item = p_g_menu_item_new_from_model(model, i);
 		int keep = 1;
+
+		proxy_item(model, i, item, scope);
 
 		const char *links[] = { "section", "submenu" };
 		for (int l = 0; l < 2 && depth < 16; l++) {
@@ -342,7 +538,7 @@ static GMenuModel *clean_model(GMenuModel *model, int depth, int *dropped)
 			if (child == NULL)
 				continue;
 
-			GMenuModel *cleaned = clean_model(child, depth + 1, dropped);
+			GMenuModel *cleaned = clean_model(child, depth + 1, scope);
 			p_g_object_unref(child);
 
 			if (p_g_menu_model_get_n_items(cleaned) == 0)
@@ -355,7 +551,7 @@ static GMenuModel *clean_model(GMenuModel *model, int depth, int *dropped)
 		if (keep)
 			p_g_menu_append_item(out, item);
 		else
-			(*dropped)++;
+			scope->dropped++;
 		p_g_object_unref(item);
 	}
 
@@ -364,38 +560,60 @@ static GMenuModel *clean_model(GMenuModel *model, int depth, int *dropped)
 
 /* ---- attaching ----------------------------------------------------------- */
 
+/* The menubar we set, to tell it from one the application set itself. */
+static GMenuModel *our_menubar;
+
 static void attach_menubar(GtkWindow *window)
 {
 	GtkApplication *app = p_gtk_window_get_application(window);
 
 	if (app == NULL)
 		return;
-	if (p_gtk_application_get_menubar(app) != NULL) {
+
+	GMenuModel *existing = p_gtk_application_get_menubar(app);
+	if (existing != NULL && existing != our_menubar) {
 		note("the application already has a menubar");
 		return;
 	}
 
 	/* The title bar is not part of the ordinary child tree, and yelp keeps
 	   its header bar in the content rather than the title bar. Try both. */
-	GMenuModel *model = find_menu_model(p_gtk_window_get_titlebar(window), 0);
+	GtkWidget *owner = NULL;
+	GMenuModel *model =
+		find_menu_model(p_gtk_window_get_titlebar(window), 0, &owner);
 	if (model == NULL)
-		model = find_menu_model(p_gtk_window_get_child(window), 0);
+		model = find_menu_model(p_gtk_window_get_child(window), 0, &owner);
 
 	if (model == NULL) {
 		note("no menu model in this window");
 		return;
 	}
 
-	int dropped = 0;
-	GMenuModel *cleaned = clean_model(model, 0, &dropped);
-	if (dropped > 0)
-		note("dropped %d item(s) that cannot cross D-Bus", dropped);
+	struct scope scope = {
+		.owner = owner,
+		.map = is_a(window, type_app_window) ? (GActionMap *)window
+						     : NULL,
+	};
+	GMenuModel *cleaned = clean_model(model, 0, &scope);
+
+	/* The menubar is per application, but "win." resolves against the
+	   focused window. A second window of the same application needs the
+	   same stand-ins in its own map; the copy made for it is thrown away. */
+	if (existing != NULL) {
+		note("menubar already ours, stand-ins added for this window");
+		p_g_object_unref(cleaned);
+		return;
+	}
+
+	if (scope.dropped > 0)
+		note("dropped %d item(s) that cannot cross D-Bus", scope.dropped);
 
 	gchar *label = menu_label(app);
 	GMenu *menubar = p_g_menu_new();
 	p_g_menu_append_submenu(menubar, label, cleaned);
 	p_g_object_unref(cleaned);
 	p_gtk_application_set_menubar(app, (GMenuModel *)menubar);
+	our_menubar = (GMenuModel *)menubar;
 	p_g_object_unref(menubar);
 	note("menubar attached, labelled \"%s\"", label);
 	p_g_free(label);
@@ -408,7 +626,10 @@ static void (*real_app_window_realize)(GtkWidget *);
 
 static void shim_window_realize(GtkWidget *widget)
 {
-	attach_menubar((GtkWindow *)widget);
+	/* GtkApplicationWindow's realize chains up to this one; when it has a
+	   hook of its own the window has already been handled there. */
+	if (real_app_window_realize == NULL || !is_a(widget, type_app_window))
+		attach_menubar((GtkWindow *)widget);
 	if (real_window_realize != NULL)
 		real_window_realize(widget);
 }

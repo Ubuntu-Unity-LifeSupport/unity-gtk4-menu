@@ -1,3 +1,19 @@
+unity-gtk4-menu (0.4) resolute; urgency=medium
+
+  * Make menu items that name widget class actions work in the global menu.
+    An action installed with gtk_widget_class_install_action() is resolved
+    through the widget's action muxer inside the application, but is not in
+    the window's exported action group, so Unity showed the item greyed out -
+    yelp's "About Help" (win.yelp-show-about-dialog) is one. The exported
+    copy of the model now points such items at a stand-in in the window's
+    action map, which activates the original name from the menu's owner
+    widget. Property actions and names with a prefix other than app. or win.
+    are left as they are.
+  * Handle each GtkApplicationWindow once per realize rather than twice: its
+    realize chains up to GtkWindow's, which is hooked too.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Wed, 23 Sep 2026 23:10:00 +0000
+
 unity-gtk4-menu (0.3) resolute; urgency=medium
 
   * Drop menu items that carry a "custom" attribute before exporting, along
