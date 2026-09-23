@@ -34,6 +34,23 @@ file of the same name:
     # one user
     touch ~/.config/environment.d/60-unity-gtk4-menu.conf
 
+## Which menu
+
+A window often has several menu buttons. The library collects all of them and
+exports the one that ranks first by:
+
+1. shown - visible, and not inside a stack page, tab overview or similar
+   part of the window that its container keeps hidden;
+2. marked primary with `gtk_menu_button_set_primary()` - the button F10
+   opens, which libadwaita applications set on their main menu;
+3. the number of items naming `app.` or `win.` actions - the main menu is made
+   of those, secondary menus usually of actions scoped to one widget;
+4. tree order.
+
+The choice is made once, when the window is realized, and the copy does not
+follow later changes: an application that swaps its header bar when a
+document opens (papers) keeps the menu it showed at start.
+
 ## Actions the window does not export
 
 The global menu can only activate what the application exports over D-Bus: the
@@ -49,7 +66,9 @@ activates the original from the menu button. Known limits:
 
 - A stand-in is always shown enabled. GTK has no public getter for a class
   action's enabled state; activating a disabled one does nothing, as it would
-  in the application.
+  in the application. Items the application hides while their action is
+  disabled (`hidden-when="action-disabled"`) are therefore always shown -
+  gnome-text-editor lists both "Fullscreen" and "Leave Fullscreen".
 - Property actions (`gtk_widget_class_install_property_action()`) are left
   alone: they carry state a plain stand-in cannot mirror.
 - Actions with a prefix other than `app.` or `win.` usually come from a group

@@ -119,6 +119,9 @@ DECL(void, g_settings_schema_unref, (GSettingsSchema *));
 DECL(GSettings *, g_settings_new, (const gchar *));
 DECL(gboolean, g_settings_get_boolean, (GSettings *, const gchar *));
 DECL(GtkWidget *, gtk_widget_get_parent, (GtkWidget *));
+DECL(gboolean, gtk_menu_button_get_primary, (GtkMenuButton *));
+DECL(gboolean, gtk_widget_is_visible, (GtkWidget *));
+DECL(gboolean, gtk_widget_get_child_visible, (GtkWidget *));
 DECL(gboolean, gtk_widget_class_query_action,
      (GtkWidgetClass *, guint, GType *, const char **, const GVariantType **,
       const char **));
@@ -191,6 +194,8 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(gio, g_settings_get_boolean);
 
 	RESOLVE(gtk, gtk_widget_get_parent);
+	RESOLVE(gtk, gtk_widget_is_visible);
+	RESOLVE(gtk, gtk_widget_get_child_visible);
 	RESOLVE(gtk, gtk_widget_class_query_action);
 	RESOLVE(gtk, gtk_widget_activate_action_variant);
 	RESOLVE(gio, g_simple_action_new);
@@ -204,6 +209,10 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(glib, g_variant_new_string);
 
 	RESOLVE(glib, g_get_application_name);
+
+	/* Optional: GTK 4.4. Without it the choice falls back to the score. */
+	*(void **)(&p_gtk_menu_button_get_primary) =
+		dlsym(gtk, "gtk_menu_button_get_primary");
 	RESOLVE(glib, g_strdup);
 	RESOLVE(glib, g_strconcat);
 	RESOLVE(glib, g_free);
@@ -225,61 +234,174 @@ static int is_a(void *instance, GType type)
 
 /* ---- finding the menu ---------------------------------------------------- */
 
-/* On success *owner is the widget the menu hangs off - the menu button or the
-   popover menu bar. Its actions resolve the way the application's own popover
-   resolves them, which is what activating a widget-scoped action needs. */
-static GMenuModel *find_menu_model(GtkWidget *widget, int depth,
-				   GtkWidget **owner)
+/*
+ * A window often has several menu buttons: gnome-calculator's mode selector,
+ * gnome-text-editor's search options and nautilus's folder menu all come
+ * before the main menu in tree order, so taking the first one exported the
+ * wrong menu in five of thirteen applications measured.
+ *
+ * So every candidate is collected and ranked by, in order:
+ *  1. shown - visible, and not in a part of the window its container keeps
+ *     hidden. Nothing is mapped yet at realize, so gtk_widget_is_visible()
+ *     alone says yes to a hidden stack page; a GtkStack, AdwToolbarView or
+ *     similar container clears child-visible on what it does not show, so
+ *     that is checked on every ancestor too. It matters: libadwaita marks
+ *     the menu of its hidden tab overview primary, while gnome-console's real
+ *     main menu is not marked at all, and papers keeps a second primary menu
+ *     in its document view, hidden until a document is open;
+ *  2. primary (gtk_menu_button_set_primary, GTK 4.4) - the button F10 opens,
+ *     which libadwaita applications set on the main menu;
+ *  3. the number of items naming app. or win. actions. The main menu is made
+ *     of those; secondary menus are usually built from a group inserted on
+ *     the widget they belong to (search-options., view.);
+ *  4. tree order.
+ */
+#define MAX_CANDIDATES 32
+
+struct candidate {
+	GtkWidget *owner; /* the menu button or the popover menu bar */
+	GMenuModel *model;
+	int shown;
+	int primary;
+	int score;
+};
+
+struct candidates {
+	struct candidate c[MAX_CANDIDATES];
+	int n;
+};
+
+static int reachable_items(GMenuModel *model, int depth);
+
+static int is_shown(GtkWidget *widget)
+{
+	if (!p_gtk_widget_is_visible(widget))
+		return 0;
+	for (GtkWidget *w = widget; w != NULL; w = p_gtk_widget_get_parent(w))
+		if (!p_gtk_widget_get_child_visible(w))
+			return 0;
+	return 1;
+}
+
+static void add_candidate(struct candidates *out, GtkWidget *owner,
+			  GMenuModel *model, int primary, int depth)
+{
+	if (out->n == MAX_CANDIDATES)
+		return;
+
+	struct candidate *c = &out->c[out->n++];
+	c->owner = owner;
+	c->model = model;
+	c->shown = is_shown(owner);
+	c->primary = primary;
+	c->score = reachable_items(model, 0);
+	note("candidate %d at depth %d: shown=%d primary=%d app./win. items=%d",
+	     out->n, depth, c->shown, c->primary, c->score);
+}
+
+static void collect_menus(GtkWidget *widget, int depth, struct candidates *out)
 {
 	if (widget == NULL || depth > 32)
-		return NULL;
+		return;
 
 	if (is_a(widget, type_menu_button)) {
 		GtkMenuButton *button = (GtkMenuButton *)widget;
 		GMenuModel *model = p_gtk_menu_button_get_menu_model(button);
-
-		if (model != NULL) {
-			note("menu button with a model at depth %d", depth);
-			*owner = widget;
-			return model;
-		}
 
 		/* An application may call gtk_menu_button_set_popover() rather
 		   than set_menu_model(), leaving get_menu_model() NULL though a
 		   menu exists - yelp does this for all four of its buttons.
 		   Where the popover is a GtkPopoverMenu the model is still
 		   reachable. */
-		GtkPopover *popover = p_gtk_menu_button_get_popover(button);
-		if (is_a(popover, type_popover_menu)) {
-			model = p_gtk_popover_menu_get_menu_model(
-				(GtkPopoverMenu *)popover);
-			if (model != NULL) {
-				note("popover menu behind a button at depth %d",
-				     depth);
-				*owner = widget;
-				return model;
-			}
+		if (model == NULL) {
+			GtkPopover *popover = p_gtk_menu_button_get_popover(button);
+			if (is_a(popover, type_popover_menu))
+				model = p_gtk_popover_menu_get_menu_model(
+					(GtkPopoverMenu *)popover);
+		}
+
+		if (model != NULL) {
+			int primary = p_gtk_menu_button_get_primary != NULL &&
+				      p_gtk_menu_button_get_primary(button);
+			add_candidate(out, widget, model, primary, depth);
 		}
 	}
 
 	if (is_a(widget, type_popover_menu_bar)) {
 		GMenuModel *model = p_gtk_popover_menu_bar_get_menu_model(
 			(GtkPopoverMenuBar *)widget);
-		if (model != NULL) {
-			note("popover menu bar at depth %d", depth);
-			*owner = widget;
-			return model;
-		}
+		if (model != NULL)
+			add_candidate(out, widget, model, 0, depth);
 	}
 
 	for (GtkWidget *child = p_gtk_widget_get_first_child(widget);
-	     child != NULL; child = p_gtk_widget_get_next_sibling(child)) {
-		GMenuModel *model = find_menu_model(child, depth + 1, owner);
-		if (model != NULL)
-			return model;
+	     child != NULL; child = p_gtk_widget_get_next_sibling(child))
+		collect_menus(child, depth + 1, out);
+}
+
+/* Items anywhere in @model whose action is app.* or win.* */
+static int reachable_items(GMenuModel *model, int depth)
+{
+	int count = 0;
+	gint n = p_g_menu_model_get_n_items(model);
+
+	for (gint i = 0; i < n; i++) {
+		GVariant *v = p_g_menu_model_get_item_attribute_value(
+			model, i, "action", G_VARIANT_TYPE_STRING);
+		if (v != NULL) {
+			const char *action = p_g_variant_get_string(v, NULL);
+			if (strncmp(action, "app.", 4) == 0 ||
+			    strncmp(action, "win.", 4) == 0)
+				count++;
+			p_g_variant_unref(v);
+		}
+
+		const char *links[] = { "section", "submenu" };
+		for (int l = 0; l < 2 && depth < 16; l++) {
+			GMenuModel *child =
+				p_g_menu_model_get_item_link(model, i, links[l]);
+			if (child != NULL) {
+				count += reachable_items(child, depth + 1);
+				p_g_object_unref(child);
+			}
+		}
 	}
 
-	return NULL;
+	return count;
+}
+
+/* On success *owner is the widget the menu hangs off. Its actions resolve the
+   way the application's own popover resolves them, which is what activating
+   a widget-scoped action needs. */
+static GMenuModel *find_menu_model(GtkWindow *window, GtkWidget **owner)
+{
+	struct candidates found = { .n = 0 };
+
+	/* The title bar is not part of the ordinary child tree, and yelp keeps
+	   its header bar in the content rather than the title bar. Try both. */
+	collect_menus(p_gtk_window_get_titlebar(window), 0, &found);
+	collect_menus(p_gtk_window_get_child(window), 0, &found);
+
+	if (found.n == 0)
+		return NULL;
+
+	int best = 0;
+	for (int i = 1; i < found.n; i++) {
+		struct candidate *c = &found.c[i], *b = &found.c[best];
+		if (c->shown != b->shown) {
+			if (c->shown)
+				best = i;
+		} else if (c->primary != b->primary) {
+			if (c->primary)
+				best = i;
+		} else if (c->score > b->score) {
+			best = i;
+		}
+	}
+	note("chose candidate %d of %d", best + 1, found.n);
+
+	*owner = found.c[best].owner;
+	return found.c[best].model;
 }
 
 /* ---- the label ----------------------------------------------------------- */
@@ -576,13 +698,8 @@ static void attach_menubar(GtkWindow *window)
 		return;
 	}
 
-	/* The title bar is not part of the ordinary child tree, and yelp keeps
-	   its header bar in the content rather than the title bar. Try both. */
 	GtkWidget *owner = NULL;
-	GMenuModel *model =
-		find_menu_model(p_gtk_window_get_titlebar(window), 0, &owner);
-	if (model == NULL)
-		model = find_menu_model(p_gtk_window_get_child(window), 0, &owner);
+	GMenuModel *model = find_menu_model(window, &owner);
 
 	if (model == NULL) {
 		note("no menu model in this window");

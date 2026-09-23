@@ -1,3 +1,16 @@
+unity-gtk4-menu (0.5) resolute; urgency=medium
+
+  * Export the window's main menu rather than the first menu button found.
+    Five of thirteen applications measured have a secondary menu earlier in
+    the widget tree - gnome-calculator's mode selector, gnome-logs's boot
+    list, simple-scan's scan type, gnome-text-editor's search options and
+    nautilus's folder menu - and got that one in the global menu instead.
+    Candidates are now ranked by: shown (visible, and not under a container
+    that keeps it hidden), marked primary with gtk_menu_button_set_primary(),
+    number of app. and win. items, then tree order.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Wed, 23 Sep 2026 23:45:00 +0000
+
 unity-gtk4-menu (0.4) resolute; urgency=medium
 
   * Make menu items that name widget class actions work in the global menu.
