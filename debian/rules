@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,-O1
+export PREFIX = /usr
+export LIBDIR = $(PREFIX)/lib/$(DEB_HOST_MULTIARCH)
+
+%:
+	dh $@
+
+# The library is preloaded into every user process, which makes ld.so print a
+# warning on each invocation of a privileged program. Marking it setuid, but
+# not executable, suppresses that warning. gtk-nocsd does the same, and cites
+# sdate as the precedent. See debian/libunity-gtk4-menu0.lintian-overrides.
+execute_after_dh_fixperms:
+	chmod 4644 debian/*/usr/lib/*/libunity-gtk4-menu.so.0

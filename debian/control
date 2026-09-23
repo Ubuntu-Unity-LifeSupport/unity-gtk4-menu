@@ -1,0 +1,37 @@
+Source: unity-gtk4-menu
+Section: x11
+Priority: optional
+Maintainer: Ubuntu Unity Life Support <mihail.rozshko@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ libgtk-4-dev,
+ libglib2.0-dev,
+ pkg-config,
+Standards-Version: 4.7.3
+Rules-Requires-Root: no
+Homepage: https://github.com/Ubuntu-Unity-LifeSupport/unity-gtk4-menu
+Vcs-Git: https://github.com/Ubuntu-Unity-LifeSupport/unity-gtk4-menu.git
+Vcs-Browser: https://github.com/Ubuntu-Unity-LifeSupport/unity-gtk4-menu
+
+Package: libunity-gtk4-menu0
+Architecture: any
+Multi-Arch: same
+Section: libs
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Description: Export GTK4 header bar menus to the Unity global menu
+ GTK4 applications keep their menu in a header bar button rather than in a menu
+ bar, so Unity's panel and HUD have nothing to show for them. GTK4 also removed
+ the module loading mechanism that appmenu-gtk-module uses to reach GTK3
+ applications, so the same approach cannot be taken.
+ .
+ This is a small LD_PRELOADable library instead. It finds the header bar's menu
+ model through public GTK API and sets it as the application's menu bar before
+ the window is realized, after which GTK4 exports it over org.gtk.Menus by
+ itself. It does nothing outside a Unity session.
+ .
+ This package includes an environment variable snippet to load the library for
+ all user processes. To disable it, create an empty file
+ /etc/environment.d/60-unity-gtk4-menu.conf for everyone, or
+ ~/.config/environment.d/60-unity-gtk4-menu.conf for one user.

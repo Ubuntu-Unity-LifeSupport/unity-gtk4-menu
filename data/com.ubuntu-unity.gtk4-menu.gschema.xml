@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="com.ubuntu-unity.gtk4-menu" path="/com/ubuntu-unity/gtk4-menu/">
+    <key name="show-application-name" type="b">
+      <default>true</default>
+      <summary>Name the exported menu after the application</summary>
+      <description>
+        GTK4 applications keep their menu in a header bar button rather than a
+        menu bar, and that menu has no name of its own. When this is enabled the
+        entry in the global menu is named after the application, which matches
+        the name the panel already shows beside it. When it is disabled a
+        neutral label is used instead, so the name is not repeated.
+      </description>
+    </key>
+  </schema>
+</schemalist>

@@ -1,0 +1,8 @@
+unity-gtk4-menu (0.1) resolute; urgency=medium
+
+  * Initial release. Exports a GTK4 header bar menu to the Unity global menu
+    and the HUD by setting it as the application menu bar before realize.
+  * show-application-name setting controls whether the exported entry is named
+    after the application or given a neutral label.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Wed, 23 Sep 2026 04:20:00 +0000

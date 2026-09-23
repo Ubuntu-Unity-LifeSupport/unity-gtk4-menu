@@ -1,0 +1,10 @@
+# The library is installed setuid root, but not executable, to suppress the
+# warning the dynamic linker prints when a preloaded library is present while
+# running a privileged program. Since this library is preloaded for the whole
+# session, every invocation of such a program would otherwise print one. The
+# file mode follows gtk-nocsd, which in turn cites sdate.
+elevated-privileges 4644 root/root [usr/lib/*/libunity-gtk4-menu.so.0]
+non-standard-setuid-executable-perm 4644 [usr/lib/*/libunity-gtk4-menu.so.0]
+odd-permissions-on-shared-library 4644 [usr/lib/*/libunity-gtk4-menu.so.0]
+# There is no -dev package: nothing links against this, it is preloaded.
+package-name-doesnt-match-sonames libunity-gtk4-menu0
