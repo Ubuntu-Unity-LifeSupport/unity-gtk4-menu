@@ -1,52 +1,58 @@
 /*
- * unity-gtk4-shim - experiment for Layer B of unity-distro.
+ * unity-gtk4-menu - export a GTK4 header bar menu to the Unity global menu.
  *
- * GTK4 has no module loading mechanism, so the way appmenu-gtk-module reaches
- * GTK3 applications is unavailable. What is available is symbol interposition,
- * the same technique libgtk-nocsd already uses in the Unity session.
+ * GTK4 applications keep their menu in a GtkMenuButton in the header bar
+ * rather than in a menu bar, so Unity's panel has nothing to show for them.
+ * GTK4 also removed the module loading mechanism appmenu-gtk-module uses to
+ * reach GTK3 applications, so there is no module to write. This is an
+ * LD_PRELOAD library instead: it overwrites realize in the GtkWindow class
+ * vtable, finds the header bar's menu model through public API, and sets it as
+ * the application menu bar before the window is realized. GTK4 exports it over
+ * org.gtk.Menus by itself from there.
  *
- * GTK4 still exports a menubar over org.gtk.Menus and advertises it through
- * _GTK_MENUBAR_OBJECT_PATH, and the Unity panel renders it. Applications
- * simply never call gtk_application_set_menubar(): their menu lives in a
- * GtkMenuButton in the header bar.
+ * NOTHING HERE MAY BE LINKED AGAINST GTK OR GLIB.
  *
- * The menubar has to be set before the window is realized - attaching one
- * afterwards silently does nothing. gtk_window_present() is the last moment
- * the application controls before realize, so that is where we intervene.
+ * A preloaded library enters every process on the machine, not only the
+ * applications it was written for. An earlier version linked libgtk-4.so.1 and
+ * called g_type_class_ref() from its constructor; installed session-wide it
+ * dragged GTK4 into GTK3 processes and killed unity-settings-daemon, onboard,
+ * apport-gtk and the indicators outright:
+ *
+ *     Gdk-ERROR: gdk_display_manager_get() was called before gtk_init()
+ *
+ * So every symbol is resolved with dlsym at runtime and the library does
+ * nothing unless GTK4 is already loaded in this process. The headers are
+ * included for their type and struct definitions only - a header costs
+ * nothing, a call costs a NEEDED entry. Never call a GTK or GLib function
+ * directly here, and never use the GTK_IS_* or GTK_TYPE_* macros: they expand
+ * into calls. Use is_a() and the cached types instead.
+ *
+ * gtk-nocsd, which ships in Ubuntu Unity and does the same job for window
+ * decorations, is built this way for the same reason.
  */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
 #include <string.h>
-#include <glib/gi18n.h>
 #include <unistd.h>
+
 #include <gtk/gtk.h>
-#include <gdk/x11/gdkx.h>
 #include <gio/gdesktopappinfo.h>
 
-static int verbose(void) {
-	static int v = -1;
-	if (v < 0)
-		v = getenv("UNITY_GTK4_SHIM_DEBUG") != NULL;
-	return v;
-}
+#define SHIM_SCHEMA "com.ubuntu-unity.gtk4-menu"
 
-/*
- * Log to a file rather than stderr when UNITY_GTK4_SHIM_LOG is set. The window
- * is often created in a different process from the one launched - file-roller
- * and simple-scan both do this - and that process inherits the environment but
- * not the caller's redirected stderr, so stderr output simply disappears.
- */
-static void note_out(const char *fmt, ...)
+static int debug_on;
+
+static void note(const char *fmt, ...)
 {
-	if (!verbose())
+	if (!debug_on)
 		return;
 
 	va_list ap;
-	const char *path = getenv("UNITY_GTK4_SHIM_LOG");
+	const char *path = getenv("UNITY_GTK4_MENU_LOG");
 	FILE *out = stderr;
 
 	if (path != NULL) {
@@ -55,7 +61,7 @@ static void note_out(const char *fmt, ...)
 			out = f;
 	}
 
-	fprintf(out, "[unity-gtk4-shim %d] ", (int)getpid());
+	fprintf(out, "[unity-gtk4-menu %d] ", (int)getpid());
 	va_start(ap, fmt);
 	vfprintf(out, fmt, ap);
 	va_end(ap);
@@ -66,52 +72,155 @@ static void note_out(const char *fmt, ...)
 		fclose(out);
 }
 
-#define note(...) note_out(__VA_ARGS__)
+/* ---- resolved symbols ---------------------------------------------------- */
 
-/* Depth-first search for the first GtkMenuButton carrying a menu model. */
+#define DECL(ret, name, args) static ret (*p_##name) args
+
+DECL(gpointer, g_type_class_ref, (GType));
+DECL(gboolean, g_type_check_instance_is_a, (GTypeInstance *, GType));
+DECL(void, g_object_unref, (gpointer));
+DECL(GType, gtk_window_get_type, (void));
+DECL(GType, gtk_application_window_get_type, (void));
+DECL(GType, gtk_menu_button_get_type, (void));
+DECL(GType, gtk_popover_menu_get_type, (void));
+DECL(GType, gtk_popover_menu_bar_get_type, (void));
+DECL(GtkWidget *, gtk_window_get_titlebar, (GtkWindow *));
+DECL(GtkWidget *, gtk_window_get_child, (GtkWindow *));
+DECL(GtkWidget *, gtk_widget_get_first_child, (GtkWidget *));
+DECL(GtkWidget *, gtk_widget_get_next_sibling, (GtkWidget *));
+DECL(GMenuModel *, gtk_menu_button_get_menu_model, (GtkMenuButton *));
+DECL(GtkPopover *, gtk_menu_button_get_popover, (GtkMenuButton *));
+DECL(GMenuModel *, gtk_popover_menu_get_menu_model, (GtkPopoverMenu *));
+DECL(GMenuModel *, gtk_popover_menu_bar_get_menu_model, (GtkPopoverMenuBar *));
+DECL(GtkApplication *, gtk_window_get_application, (GtkWindow *));
+DECL(GMenuModel *, gtk_application_get_menubar, (GtkApplication *));
+DECL(void, gtk_application_set_menubar, (GtkApplication *, GMenuModel *));
+DECL(GMenu *, g_menu_new, (void));
+DECL(void, g_menu_append_submenu, (GMenu *, const gchar *, GMenuModel *));
+DECL(const gchar *, g_get_application_name, (void));
+DECL(gchar *, g_strdup, (const gchar *));
+DECL(gchar *, g_strconcat, (const gchar *, ...));
+DECL(void, g_free, (gpointer));
+DECL(const gchar *, g_application_get_application_id, (GApplication *));
+DECL(GDesktopAppInfo *, g_desktop_app_info_new, (const gchar *));
+DECL(const char *, g_app_info_get_name, (GAppInfo *));
+DECL(GSettingsSchemaSource *, g_settings_schema_source_get_default, (void));
+DECL(GSettingsSchema *, g_settings_schema_source_lookup,
+     (GSettingsSchemaSource *, const gchar *, gboolean));
+DECL(void, g_settings_schema_unref, (GSettingsSchema *));
+DECL(GSettings *, g_settings_new, (const gchar *));
+DECL(gboolean, g_settings_get_boolean, (GSettings *, const gchar *));
+
+static GType type_window, type_app_window, type_menu_button;
+static GType type_popover_menu, type_popover_menu_bar;
+
+#define RESOLVE(handle, name)                                                  \
+	do {                                                                   \
+		*(void **)(&p_##name) = dlsym(handle, #name);                  \
+		if (p_##name == NULL) {                                        \
+			note("dlsym failed for %s", #name);                    \
+			return 0;                                              \
+		}                                                              \
+	} while (0)
+
+static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
+{
+	RESOLVE(gobj, g_type_class_ref);
+	RESOLVE(gobj, g_type_check_instance_is_a);
+	RESOLVE(gobj, g_object_unref);
+
+	RESOLVE(gtk, gtk_window_get_type);
+	RESOLVE(gtk, gtk_application_window_get_type);
+	RESOLVE(gtk, gtk_menu_button_get_type);
+	RESOLVE(gtk, gtk_popover_menu_get_type);
+	RESOLVE(gtk, gtk_popover_menu_bar_get_type);
+	RESOLVE(gtk, gtk_window_get_titlebar);
+	RESOLVE(gtk, gtk_window_get_child);
+	RESOLVE(gtk, gtk_widget_get_first_child);
+	RESOLVE(gtk, gtk_widget_get_next_sibling);
+	RESOLVE(gtk, gtk_menu_button_get_menu_model);
+	RESOLVE(gtk, gtk_menu_button_get_popover);
+	RESOLVE(gtk, gtk_popover_menu_get_menu_model);
+	RESOLVE(gtk, gtk_popover_menu_bar_get_menu_model);
+	RESOLVE(gtk, gtk_window_get_application);
+	RESOLVE(gtk, gtk_application_get_menubar);
+	RESOLVE(gtk, gtk_application_set_menubar);
+
+	RESOLVE(gio, g_menu_new);
+	RESOLVE(gio, g_menu_append_submenu);
+	RESOLVE(gio, g_application_get_application_id);
+	RESOLVE(gio, g_desktop_app_info_new);
+	RESOLVE(gio, g_app_info_get_name);
+	RESOLVE(gio, g_settings_schema_source_get_default);
+	RESOLVE(gio, g_settings_schema_source_lookup);
+	RESOLVE(gio, g_settings_schema_unref);
+	RESOLVE(gio, g_settings_new);
+	RESOLVE(gio, g_settings_get_boolean);
+
+	RESOLVE(glib, g_get_application_name);
+	RESOLVE(glib, g_strdup);
+	RESOLVE(glib, g_strconcat);
+	RESOLVE(glib, g_free);
+
+	type_window = p_gtk_window_get_type();
+	type_app_window = p_gtk_application_window_get_type();
+	type_menu_button = p_gtk_menu_button_get_type();
+	type_popover_menu = p_gtk_popover_menu_get_type();
+	type_popover_menu_bar = p_gtk_popover_menu_bar_get_type();
+
+	return 1;
+}
+
+static int is_a(void *instance, GType type)
+{
+	return instance != NULL &&
+	       p_g_type_check_instance_is_a((GTypeInstance *)instance, type);
+}
+
+/* ---- finding the menu ---------------------------------------------------- */
+
 static GMenuModel *find_menu_model(GtkWidget *widget, int depth)
 {
 	if (widget == NULL || depth > 32)
 		return NULL;
 
-	if (GTK_IS_MENU_BUTTON(widget)) {
-		GtkMenuButton *button = GTK_MENU_BUTTON(widget);
-		GMenuModel *model = gtk_menu_button_get_menu_model(button);
+	if (is_a(widget, type_menu_button)) {
+		GtkMenuButton *button = (GtkMenuButton *)widget;
+		GMenuModel *model = p_gtk_menu_button_get_menu_model(button);
 
 		if (model != NULL) {
-			note("found GtkMenuButton with a model at depth %d", depth);
+			note("menu button with a model at depth %d", depth);
 			return model;
 		}
 
-		/*
-		 * An application that calls gtk_menu_button_set_popover()
-		 * instead of set_menu_model() leaves get_menu_model() NULL.
-		 * yelp does this for all four of its menu buttons. When the
-		 * popover is a GtkPopoverMenu the model is still reachable.
-		 */
-		GtkPopover *popover = gtk_menu_button_get_popover(button);
-		if (popover != NULL && GTK_IS_POPOVER_MENU(popover)) {
-			model = gtk_popover_menu_get_menu_model(
-				GTK_POPOVER_MENU(popover));
+		/* An application may call gtk_menu_button_set_popover() rather
+		   than set_menu_model(), leaving get_menu_model() NULL though a
+		   menu exists - yelp does this for all four of its buttons.
+		   Where the popover is a GtkPopoverMenu the model is still
+		   reachable. */
+		GtkPopover *popover = p_gtk_menu_button_get_popover(button);
+		if (is_a(popover, type_popover_menu)) {
+			model = p_gtk_popover_menu_get_menu_model(
+				(GtkPopoverMenu *)popover);
 			if (model != NULL) {
-				note("found GtkPopoverMenu behind a menu button at depth %d",
+				note("popover menu behind a button at depth %d",
 				     depth);
 				return model;
 			}
 		}
 	}
 
-	if (GTK_IS_POPOVER_MENU_BAR(widget)) {
-		GMenuModel *model = gtk_popover_menu_bar_get_menu_model(
-			GTK_POPOVER_MENU_BAR(widget));
+	if (is_a(widget, type_popover_menu_bar)) {
+		GMenuModel *model = p_gtk_popover_menu_bar_get_menu_model(
+			(GtkPopoverMenuBar *)widget);
 		if (model != NULL) {
-			note("found GtkPopoverMenuBar with a model at depth %d", depth);
+			note("popover menu bar at depth %d", depth);
 			return model;
 		}
 	}
 
-	for (GtkWidget *child = gtk_widget_get_first_child(widget);
-	     child != NULL; child = gtk_widget_get_next_sibling(child)) {
+	for (GtkWidget *child = p_gtk_widget_get_first_child(widget);
+	     child != NULL; child = p_gtk_widget_get_next_sibling(child)) {
 		GMenuModel *model = find_menu_model(child, depth + 1);
 		if (model != NULL)
 			return model;
@@ -120,377 +229,121 @@ static GMenuModel *find_menu_model(GtkWidget *widget, int depth)
 	return NULL;
 }
 
-/* Print the top level of a model: what a hamburger menu is actually made of. */
-static void dump_model(GMenuModel *model)
-{
-	if (!verbose() || model == NULL)
-		return;
+/* ---- the label ----------------------------------------------------------- */
 
-	int n = g_menu_model_get_n_items(model);
-	note("model has %d top-level item(s)", n);
-
-	for (int i = 0; i < n; i++) {
-		char *label = NULL;
-		gboolean has_label = g_menu_model_get_item_attribute(
-			model, i, G_MENU_ATTRIBUTE_LABEL, "s", &label);
-		GMenuModel *section =
-			g_menu_model_get_item_link(model, i, G_MENU_LINK_SECTION);
-		GMenuModel *submenu =
-			g_menu_model_get_item_link(model, i, G_MENU_LINK_SUBMENU);
-
-		note("  [%d] %s%s%s  label=%s", i,
-		     section ? "section" : "", submenu ? "submenu" : "",
-		     (!section && !submenu) ? "item" : "",
-		     has_label ? label : "(none)");
-
-		if (section != NULL) {
-			note("       section holds %d item(s)",
-			     g_menu_model_get_n_items(section));
-			g_object_unref(section);
-		}
-		if (submenu != NULL)
-			g_object_unref(submenu);
-		if (has_label)
-			g_free(label);
-	}
-}
-
-/* Walk the widget tree printing types, to see what an application is made of. */
-static void dump_tree(GtkWidget *widget, int depth)
-{
-	if (widget == NULL || depth > 24)
-		return;
-
-	const char *type = G_OBJECT_TYPE_NAME(widget);
-	gboolean interesting = GTK_IS_MENU_BUTTON(widget) ||
-			       GTK_IS_POPOVER_MENU_BAR(widget) ||
-			       GTK_IS_POPOVER(widget);
-
-	note("  tree %*s%s%s", depth * 2, "", type,
-	     interesting ? "   <-- menu-ish" : "");
-
-	if (GTK_IS_MENU_BUTTON(widget)) {
-		GMenuModel *m = gtk_menu_button_get_menu_model(GTK_MENU_BUTTON(widget));
-		GtkWidget *pop = GTK_WIDGET(gtk_menu_button_get_popover(GTK_MENU_BUTTON(widget)));
-		note("  tree %*s     model=%s popover=%s", depth * 2, "",
-		     m ? "yes" : "no", pop ? G_OBJECT_TYPE_NAME(pop) : "no");
-	}
-
-	for (GtkWidget *c = gtk_widget_get_first_child(widget); c != NULL;
-	     c = gtk_widget_get_next_sibling(c))
-		dump_tree(c, depth + 1);
-}
-
-#define SHIM_SCHEMA "com.ubuntu-unity.gtk4-menu"
-
-/*
- * A hamburger menu has no name of its own, so the entry we create needs one.
- * Named after the application it repeats the name the panel already shows
- * beside it; named neutrally it does not, at the cost of saying less.
- *
- * There is no right answer, and the desktops that ship a global menu treat it
- * as a preference rather than settle it: Cinnamon's Global Application Menu
- * applet offers showing or hiding the application name, and vala-panel-appmenu
- * carries the same discussion. So it is a setting here too.
- *
- * UNITY_GTK4_SHIM_LABEL=app|generic overrides it for testing, and is also what
- * runs if the schema is not installed.
- */
-static char *menu_label(GtkApplication *app)
+static gchar *menu_label(GtkApplication *app)
 {
 	gboolean use_app_name = TRUE;
-	const char *override = getenv("UNITY_GTK4_SHIM_LABEL");
+	const char *override = getenv("UNITY_GTK4_MENU_LABEL");
 
 	if (override != NULL) {
 		use_app_name = (strcmp(override, "generic") != 0);
-		note("label mode from the environment: %s", override);
 	} else {
-		GSettingsSchemaSource *source = g_settings_schema_source_get_default();
+		GSettingsSchemaSource *source =
+			p_g_settings_schema_source_get_default();
 		GSettingsSchema *schema =
-			source ? g_settings_schema_source_lookup(source, SHIM_SCHEMA, TRUE)
+			source ? p_g_settings_schema_source_lookup(
+					 source, SHIM_SCHEMA, TRUE)
 			       : NULL;
 		if (schema != NULL) {
-			GSettings *settings = g_settings_new(SHIM_SCHEMA);
-			use_app_name = g_settings_get_boolean(
+			GSettings *settings = p_g_settings_new(SHIM_SCHEMA);
+			use_app_name = p_g_settings_get_boolean(
 				settings, "show-application-name");
-			g_object_unref(settings);
-			g_settings_schema_unref(schema);
-			note("show-application-name = %s",
-			     use_app_name ? "true" : "false");
-		} else {
-			note("schema %s not installed, defaulting to the application name",
-			     SHIM_SCHEMA);
+			p_g_object_unref(settings);
+			p_g_settings_schema_unref(schema);
 		}
 	}
 
 	if (!use_app_name)
-		return g_strdup(_("Menu"));
+		return p_g_strdup("Menu");
 
-	/*
-	 * Prefer the .desktop Name, which is the field Unity's panel shows, so
-	 * that turning the setting on really does repeat what is beside it
-	 * rather than something approximately like it.
-	 */
-	const char *app_id = g_application_get_application_id(G_APPLICATION(app));
+	/* Prefer the .desktop Name: that is the field Unity's panel reads
+	   through BAMF, so the entry repeats it exactly rather than
+	   approximately. Only works when the file is named after the
+	   application id, which is the current convention. */
+	const char *app_id =
+		p_g_application_get_application_id((GApplication *)app);
 	if (app_id != NULL) {
-		char *desktop_id = g_strconcat(app_id, ".desktop", NULL);
-		GDesktopAppInfo *info = g_desktop_app_info_new(desktop_id);
-		g_free(desktop_id);
+		gchar *desktop_id = p_g_strconcat(app_id, ".desktop", NULL);
+		GDesktopAppInfo *info = p_g_desktop_app_info_new(desktop_id);
+		p_g_free(desktop_id);
 
 		if (info != NULL) {
 			const char *name =
-				g_app_info_get_name(G_APP_INFO(info));
+				p_g_app_info_get_name((GAppInfo *)info);
 			if (name != NULL) {
-				char *result = g_strdup(name);
-				g_object_unref(info);
-				note("label from the .desktop file: %s", result);
+				gchar *result = p_g_strdup(name);
+				p_g_object_unref(info);
 				return result;
 			}
-			g_object_unref(info);
+			p_g_object_unref(info);
 		}
 	}
 
-	const char *fallback = g_get_application_name();
-	note("no .desktop match, falling back to %s",
-	     fallback ? fallback : "Menu");
-	return g_strdup(fallback ? fallback : "Menu");
+	const char *fallback = p_g_get_application_name();
+	return p_g_strdup(fallback ? fallback : "Menu");
 }
 
-/* Titlebar first, then the content tree - yelp keeps its header bar in the
-   content, not in the titlebar. */
-static GMenuModel *find_window_menu_model(GtkWindow *window)
-{
-	GMenuModel *model = find_menu_model(gtk_window_get_titlebar(window), 0);
-	if (model == NULL)
-		model = find_menu_model(gtk_window_get_child(window), 0);
-	return model;
-}
+/* ---- attaching ----------------------------------------------------------- */
 
 static void attach_menubar(GtkWindow *window)
 {
-	GtkApplication *app = gtk_window_get_application(window);
+	GtkApplication *app = p_gtk_window_get_application(window);
 
-	if (app == NULL) {
-		note("window has no GtkApplication, nothing to attach to");
+	if (app == NULL)
+		return;
+	if (p_gtk_application_get_menubar(app) != NULL) {
+		note("the application already has a menubar");
 		return;
 	}
-	if (gtk_application_get_menubar(app) != NULL) {
-		note("application already has a menubar, leaving it alone");
-		return;
-	}
 
-	if (getenv("UNITY_GTK4_SHIM_TREE") != NULL) {
-		note("TREE titlebar:");
-		dump_tree(gtk_window_get_titlebar(window), 0);
-		note("TREE content:");
-		dump_tree(gtk_window_get_child(window), 0);
-	}
-
-	/* The title bar is not part of the ordinary child tree. */
-	GMenuModel *model = find_menu_model(gtk_window_get_titlebar(window), 0);
+	/* The title bar is not part of the ordinary child tree, and yelp keeps
+	   its header bar in the content rather than the title bar. Try both. */
+	GMenuModel *model = find_menu_model(p_gtk_window_get_titlebar(window), 0);
 	if (model == NULL)
-		model = find_menu_model(gtk_window_get_child(window), 0);
+		model = find_menu_model(p_gtk_window_get_child(window), 0);
 
 	if (model == NULL) {
-		note("no menu model found in this window");
-		if (getenv("UNITY_GTK4_SHIM_TREE") != NULL) {
-			note("titlebar tree:");
-			dump_tree(gtk_window_get_titlebar(window), 0);
-			note("content tree:");
-			dump_tree(gtk_window_get_child(window), 0);
-		}
+		note("no menu model in this window");
 		return;
 	}
 
-	dump_model(model);
-
-	char *app_label = menu_label(app);
-
-	if (getenv("UNITY_GTK4_SHIM_DIRECT") != NULL) {
-		/* Hand the model over as the menubar with no wrapper at all. */
-		gtk_application_set_menubar(app, model);
-		note("menubar attached directly, no wrapper");
-		return;
-	}
-
-	GMenu *menubar = g_menu_new();
-
-	if (getenv("UNITY_GTK4_SHIM_FLATTEN") != NULL) {
-		/*
-		 * Promote each section of the hamburger menu to its own
-		 * top-level menu, which is the shape Unity expects from a
-		 * GTK3 application. Sections mostly carry no label, so this
-		 * only works as far as the labels do.
-		 */
-		int n = g_menu_model_get_n_items(model);
-		int promoted = 0;
-
-		for (int i = 0; i < n; i++) {
-			GMenuModel *section = g_menu_model_get_item_link(
-				model, i, G_MENU_LINK_SECTION);
-			if (section == NULL)
-				continue;
-
-			char *label = NULL;
-			if (!g_menu_model_get_item_attribute(
-				    model, i, G_MENU_ATTRIBUTE_LABEL, "s",
-				    &label))
-				label = NULL;
-
-			g_menu_append_submenu(menubar,
-					      label ? label : app_label,
-					      section);
-			promoted++;
-
-			g_free(label);
-			g_object_unref(section);
-		}
-
-		note("flattened: promoted %d section(s) of %d", promoted, n);
-
-		if (promoted == 0) {
-			g_menu_append_submenu(menubar, app_label, model);
-			note("nothing to promote, fell back to a single menu");
-		}
-	} else {
-		/* One top-level entry holding the whole hamburger menu. */
-		g_menu_append_submenu(menubar, app_label, model);
-		note("menubar attached, labelled \"%s\"", app_label);
-	}
-
-	gtk_application_set_menubar(app, G_MENU_MODEL(menubar));
-	g_object_unref(menubar);
-	g_free(app_label);
+	gchar *label = menu_label(app);
+	GMenu *menubar = p_g_menu_new();
+	p_g_menu_append_submenu(menubar, label, model);
+	p_gtk_application_set_menubar(app, (GMenuModel *)menubar);
+	p_g_object_unref(menubar);
+	note("menubar attached, labelled \"%s\"", label);
+	p_g_free(label);
 }
 
-/*
- * Interposing gtk_window_present / gtk_widget_set_visible / gtk_widget_show
- * catches applications that show their window themselves, but not ones where
- * the call is made from inside GTK or libadwaita - file-roller is one, and
- * none of the three ever fired for it.
- *
- * So do what appmenu-gtk-module does for GTK3: overwrite realize in the class
- * vtable. The reason that module cannot do it under GTK4 is that it has no way
- * to get loaded, which is exactly what LD_PRELOAD solves. Type registration
- * does not need gtk_init(), so g_type_class_ref works from a constructor.
- */
+/* ---- the hook ------------------------------------------------------------ */
 
-static void (*real_window_realize)(GtkWidget *) = NULL;
-static void (*real_app_window_realize)(GtkWidget *) = NULL;
-
-/*
- * Unity's indicator-appmenu reads five window properties, not one. Among them
- * _GTK_APP_MENU_OBJECT_PATH, the old GNOME application menu - and
- * add_application_menu() in window-menu-model.c labels that entry with the
- * application name on its own, falling back to "Unknown Application Name".
- *
- * GTK4 removed gtk_application_set_app_menu(), so no GTK4 application ever
- * sets that property, but the consumer still honours it. Export the model
- * ourselves and set the property, and Unity names the entry by its own
- * convention instead of one we invent.
- *
- * Must run after realize: before it there is no surface and no X11 window.
- */
-static void publish_app_menu(GtkWindow *window, GMenuModel *model)
-{
-	GtkApplication *app = gtk_window_get_application(window);
-	if (app == NULL || model == NULL)
-		return;
-
-	GDBusConnection *bus =
-		g_application_get_dbus_connection(G_APPLICATION(app));
-	const char *base =
-		g_application_get_dbus_object_path(G_APPLICATION(app));
-	if (bus == NULL || base == NULL) {
-		note("no session bus or object path, cannot publish app menu");
-		return;
-	}
-
-	char *path = g_strconcat(base, "/unityshim/appmenu", NULL);
-
-	GError *error = NULL;
-	guint id = g_dbus_connection_export_menu_model(bus, path, model, &error);
-	if (id == 0) {
-		note("export failed: %s", error ? error->message : "unknown");
-		g_clear_error(&error);
-		g_free(path);
-		return;
-	}
-
-	GdkSurface *surface = gtk_native_get_surface(GTK_NATIVE(window));
-	if (surface == NULL || !GDK_IS_X11_SURFACE(surface)) {
-		note("not an X11 surface, cannot set the property");
-		g_free(path);
-		return;
-	}
-
-	Display *xdisplay = GDK_SURFACE_XDISPLAY(surface);
-	Window xid = gdk_x11_surface_get_xid(GDK_X11_SURFACE(surface));
-
-	XChangeProperty(xdisplay, xid,
-			XInternAtom(xdisplay, "_GTK_APP_MENU_OBJECT_PATH", False),
-			XInternAtom(xdisplay, "UTF8_STRING", False),
-			8, PropModeReplace,
-			(const unsigned char *)path, strlen(path));
-
-	note("published app menu at %s", path);
-	g_free(path);
-}
+static void (*real_window_realize)(GtkWidget *);
+static void (*real_app_window_realize)(GtkWidget *);
 
 static void shim_window_realize(GtkWidget *widget)
 {
-	note("realize (GtkWindow)");
-
-	if (getenv("UNITY_GTK4_SHIM_APPMENU") != NULL) {
-		if (real_window_realize != NULL)
-			real_window_realize(widget);
-		publish_app_menu(GTK_WINDOW(widget),
-				 find_window_menu_model(GTK_WINDOW(widget)));
-		return;
-	}
-
-	attach_menubar(GTK_WINDOW(widget));
+	attach_menubar((GtkWindow *)widget);
 	if (real_window_realize != NULL)
 		real_window_realize(widget);
 }
 
 static void shim_app_window_realize(GtkWidget *widget)
 {
-	note("realize (GtkApplicationWindow)");
-
-	if (getenv("UNITY_GTK4_SHIM_APPMENU") != NULL) {
-		if (real_app_window_realize != NULL)
-			real_app_window_realize(widget);
-		publish_app_menu(GTK_WINDOW(widget),
-				 find_window_menu_model(GTK_WINDOW(widget)));
-		return;
-	}
-
-	attach_menubar(GTK_WINDOW(widget));
+	attach_menubar((GtkWindow *)widget);
 	if (real_app_window_realize != NULL)
 		real_app_window_realize(widget);
 }
 
-/*
- * Only act under Unity. gtk-nocsd does the same thing in reverse - it disables
- * itself on everything GNOME except Flashback - because a library preloaded
- * session-wide ends up inside every process on the machine, including ones
- * that have nothing to do with the desktop it was meant for.
- *
- * gtk-nocsd goes further and removes itself: it blanks LD_PRELOAD in environ
- * and execve()s the program again. That is worth knowing but not worth copying
- * yet - a re-exec is a heavy thing to do inside somebody else's process, and
- * returning early costs nothing.
- */
 static int wanted_here(void)
 {
-	const char *desktop = getenv("XDG_CURRENT_DESKTOP");
-
-	if (getenv("UNITY_GTK4_SHIM_FORCE") != NULL)
+	if (getenv("UNITY_GTK4_MENU_FORCE") != NULL)
 		return 1;
 
+	const char *desktop = getenv("XDG_CURRENT_DESKTOP");
 	if (desktop == NULL || strstr(desktop, "Unity") == NULL) {
-		note("XDG_CURRENT_DESKTOP=%s is not Unity, doing nothing",
+		note("XDG_CURRENT_DESKTOP=%s is not Unity",
 		     desktop ? desktop : "(unset)");
 		return 0;
 	}
@@ -500,15 +353,39 @@ static int wanted_here(void)
 
 __attribute__((constructor)) static void shim_init(void)
 {
+	debug_on = getenv("UNITY_GTK4_MENU_DEBUG") != NULL;
+
 	if (!wanted_here())
 		return;
 
-	note("env: DIRECT=%s FLATTEN=%s LOG=%s",
-	     getenv("UNITY_GTK4_SHIM_DIRECT") ? "set" : "-",
-	     getenv("UNITY_GTK4_SHIM_FLATTEN") ? "set" : "-",
-	     getenv("UNITY_GTK4_SHIM_LOG") ? getenv("UNITY_GTK4_SHIM_LOG") : "-");
+	/*
+	 * RTLD_NOLOAD is the whole point: it returns a handle only if the
+	 * library is ALREADY mapped into this process. In anything that is not
+	 * a GTK4 application - which is most of the processes on the machine -
+	 * this returns NULL and we stop here without having touched GTK.
+	 */
+	void *gtk = dlopen("libgtk-4.so.1", RTLD_LAZY | RTLD_NOLOAD);
+	if (gtk == NULL) {
+		note("GTK4 is not loaded in this process, doing nothing");
+		return;
+	}
 
-	GtkWidgetClass *window_class = g_type_class_ref(GTK_TYPE_WINDOW);
+	void *gobj = dlopen("libgobject-2.0.so.0", RTLD_LAZY | RTLD_NOLOAD);
+	void *glib = dlopen("libglib-2.0.so.0", RTLD_LAZY | RTLD_NOLOAD);
+	void *gio = dlopen("libgio-2.0.so.0", RTLD_LAZY | RTLD_NOLOAD);
+
+	if (gobj == NULL || glib == NULL || gio == NULL) {
+		note("GTK4 is present but GLib is not, which should not happen");
+		return;
+	}
+
+	if (!resolve_all(gtk, gobj, glib, gio)) {
+		note("could not resolve every symbol, doing nothing");
+		return;
+	}
+
+	GtkWidgetClass *window_class =
+		(GtkWidgetClass *)p_g_type_class_ref(type_window);
 	if (window_class != NULL) {
 		real_window_realize = window_class->realize;
 		window_class->realize = shim_window_realize;
@@ -516,9 +393,9 @@ __attribute__((constructor)) static void shim_init(void)
 	}
 
 	GtkWidgetClass *app_window_class =
-		g_type_class_ref(GTK_TYPE_APPLICATION_WINDOW);
+		(GtkWidgetClass *)p_g_type_class_ref(type_app_window);
 	if (app_window_class != NULL &&
-	    app_window_class->realize != real_window_realize) {
+	    app_window_class->realize != shim_window_realize) {
 		real_app_window_realize = app_window_class->realize;
 		app_window_class->realize = shim_app_window_realize;
 		note("hooked GtkApplicationWindow::realize");

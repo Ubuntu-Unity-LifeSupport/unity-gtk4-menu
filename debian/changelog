@@ -1,3 +1,16 @@
+unity-gtk4-menu (0.2) resolute; urgency=medium
+
+  * Resolve every GTK and GLib symbol with dlsym at runtime instead of linking
+    them. Version 0.1 had libgtk-4.so.1 in NEEDED, and since the library is
+    preloaded into every process on the machine it dragged GTK4 into GTK3
+    processes and killed unity-settings-daemon, onboard, apport-gtk and the
+    indicators.
+  * Do nothing at all unless GTK4 is already loaded in the process, tested with
+    dlopen(RTLD_NOLOAD).
+  * Build target "check" fails if a GTK or GLib library reappears in NEEDED.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Wed, 23 Sep 2026 10:45:00 +0000
+
 unity-gtk4-menu (0.1) resolute; urgency=medium
 
   * Initial release. Exports a GTK4 header bar menu to the Unity global menu
