@@ -1,3 +1,17 @@
+unity-gtk4-menu (0.8) resolute; urgency=medium
+
+  * Proxy property actions too (gtk_widget_class_install_property_action).
+    They were left out because they carry state: the stand-in is now a
+    stateful action mirroring the property - a check item for a boolean, the
+    selected radio item for an int, uint, double, string or enum, as GTK
+    defines them - and follows the property's notify signal. Activation and
+    SetState both go through the owner widget, so GTK sets the property.
+  * tests/classtest.c: a string property action with two radio items, and
+    win.flip-toggle to change the boolean property from inside the
+    application.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Thu, 24 Sep 2026 06:40:00 +0000
+
 unity-gtk4-menu (0.7) resolute; urgency=medium
 
   * Give stand-ins for class actions the enabled state of the action they
@@ -14,7 +28,7 @@ unity-gtk4-menu (0.7) resolute; urgency=medium
   * tests/classtest.c: a class action disabled in init and one that can be
     toggled over D-Bus. tests/gjstest.js: the same for gjs.
 
- -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Thu, 24 Sep 2026 08:30:00 +0000
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Thu, 24 Sep 2026 05:30:00 +0000
 
 unity-gtk4-menu (0.6) resolute; urgency=medium
 

@@ -79,8 +79,9 @@ activates the original from the menu button. Known limits:
   intercepts the setter and remembers each call on the widget. Calls GTK
   makes inside itself are not seen; they concern GTK's own widgets, which
   header bar menus do not use.
-- Property actions (`gtk_widget_class_install_property_action()`) are left
-  alone: they carry state a plain stand-in cannot mirror.
+- Property actions (`gtk_widget_class_install_property_action()`) get a
+  stateful stand-in that mirrors the property: a check item for a boolean,
+  the selected radio item otherwise.
 - Actions with a prefix other than `app.` or `win.` usually come from a group
   inserted on a sub-widget with `gtk_widget_insert_action_group()`, which
   public API cannot enumerate. They are left alone too.

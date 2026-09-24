@@ -125,6 +125,32 @@ DECL(GtkWidget *, gtk_widget_get_parent, (GtkWidget *));
 DECL(gboolean, gtk_menu_button_get_primary, (GtkMenuButton *));
 DECL(gboolean, gtk_widget_is_visible, (GtkWidget *));
 DECL(gboolean, gtk_widget_get_child_visible, (GtkWidget *));
+DECL(GSimpleAction *, g_simple_action_new_stateful,
+     (const gchar *, const GVariantType *, GVariant *));
+DECL(void, g_simple_action_set_state, (GSimpleAction *, GVariant *));
+DECL(GVariant *, g_action_get_state, (GAction *));
+DECL(gulong, g_signal_connect_object,
+     (gpointer, const gchar *, GCallback, gpointer, GConnectFlags));
+DECL(GParamSpec *, g_object_class_find_property, (GObjectClass *, const gchar *));
+DECL(void, g_object_get_property, (GObject *, const gchar *, GValue *));
+DECL(GValue *, g_value_init, (GValue *, GType));
+DECL(void, g_value_unset, (GValue *));
+DECL(gboolean, g_value_get_boolean, (const GValue *));
+DECL(gint, g_value_get_int, (const GValue *));
+DECL(guint, g_value_get_uint, (const GValue *));
+DECL(gdouble, g_value_get_double, (const GValue *));
+DECL(gfloat, g_value_get_float, (const GValue *));
+DECL(const gchar *, g_value_get_string, (const GValue *));
+DECL(gint, g_value_get_enum, (const GValue *));
+DECL(GEnumValue *, g_enum_get_value, (GEnumClass *, gint));
+DECL(void, g_type_class_unref, (gpointer));
+DECL(GType, g_type_fundamental, (GType));
+DECL(GVariant *, g_variant_new_boolean, (gboolean));
+DECL(GVariant *, g_variant_new_int32, (gint32));
+DECL(GVariant *, g_variant_new_uint32, (guint32));
+DECL(GVariant *, g_variant_new_double, (gdouble));
+DECL(gboolean, g_variant_get_boolean, (GVariant *));
+DECL(gboolean, g_variant_is_of_type, (GVariant *, const GVariantType *));
 DECL(void, g_object_set_data, (GObject *, const gchar *, gpointer));
 DECL(gpointer, g_object_get_data, (GObject *, const gchar *));
 DECL(void, g_simple_action_set_enabled, (GSimpleAction *, gboolean));
@@ -202,6 +228,30 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(gtk, gtk_widget_get_parent);
 	RESOLVE(gtk, gtk_widget_is_visible);
 	RESOLVE(gtk, gtk_widget_get_child_visible);
+	RESOLVE(gio, g_simple_action_new_stateful);
+	RESOLVE(gio, g_simple_action_set_state);
+	RESOLVE(gio, g_action_get_state);
+	RESOLVE(gobj, g_signal_connect_object);
+	RESOLVE(gobj, g_object_class_find_property);
+	RESOLVE(gobj, g_object_get_property);
+	RESOLVE(gobj, g_value_init);
+	RESOLVE(gobj, g_value_unset);
+	RESOLVE(gobj, g_value_get_boolean);
+	RESOLVE(gobj, g_value_get_int);
+	RESOLVE(gobj, g_value_get_uint);
+	RESOLVE(gobj, g_value_get_double);
+	RESOLVE(gobj, g_value_get_float);
+	RESOLVE(gobj, g_value_get_string);
+	RESOLVE(gobj, g_value_get_enum);
+	RESOLVE(gobj, g_enum_get_value);
+	RESOLVE(gobj, g_type_class_unref);
+	RESOLVE(gobj, g_type_fundamental);
+	RESOLVE(glib, g_variant_new_boolean);
+	RESOLVE(glib, g_variant_new_int32);
+	RESOLVE(glib, g_variant_new_uint32);
+	RESOLVE(glib, g_variant_new_double);
+	RESOLVE(glib, g_variant_get_boolean);
+	RESOLVE(glib, g_variant_is_of_type);
 	RESOLVE(gobj, g_object_set_data);
 	RESOLVE(gobj, g_object_get_data);
 	RESOLVE(gio, g_simple_action_set_enabled);
@@ -482,11 +532,13 @@ static gchar *menu_label(GtkApplication *app)
  * For each such item the exported copy of the model points at a stand-in added
  * to the window's action map, and the stand-in activates the original name
  * from the menu's owner widget - the same lookup the popover itself performs.
- * Only class actions positively found on the owner or its ancestors get one;
- * a property action (gtk_widget_class_install_property_action) carries state
- * a plain stand-in cannot mirror, so it is left alone and logged. So are names
- * with a prefix other than app. or win., which usually come from a group
- * inserted on a sub-widget and cannot be enumerated through public API.
+ * Only class actions positively found on the owner or its ancestors get one.
+ * A property action (gtk_widget_class_install_property_action) gets a
+ * stateful stand-in that mirrors the property - a check mark for a boolean,
+ * the selected radio item otherwise; see "property actions" below. Names
+ * with a prefix other than app. or win. usually come from a group inserted on
+ * a sub-widget, which public API cannot enumerate; they are left alone and
+ * logged.
  *
  * GTK has no public getter for a class action's enabled state, only the
  * setter gtk_widget_action_set_enabled(). So the setter is intercepted (see
@@ -543,10 +595,12 @@ static void proxy_free(gpointer data, GClosure *closure)
 	free(proxy);
 }
 
-/* Returns the widget, @widget or an ancestor, whose class has @name as a
-   stateless action, or NULL. */
+/* Returns the widget, @widget or an ancestor, whose class has @name as an
+   action, or NULL. *property is set to the property a property action is
+   bound to, NULL for an ordinary one. */
 static GtkWidget *find_class_action(GtkWidget *widget, const char *name,
-				    const GVariantType **parameter_type)
+				    const GVariantType **parameter_type,
+				    const char **property)
 {
 	for (; widget != NULL; widget = p_gtk_widget_get_parent(widget)) {
 		GtkWidgetClass *klass =
@@ -561,16 +615,90 @@ static GtkWidget *find_class_action(GtkWidget *widget, const char *name,
 		     i++) {
 			if (strcmp(action_name, name) != 0)
 				continue;
-			if (property_name != NULL) {
-				note("%s is a property action, not proxied",
-				     name);
-				return NULL;
-			}
 			*parameter_type = ptype;
+			*property = property_name;
 			return widget;
 		}
 	}
 	return NULL;
+}
+
+/*
+ * Property actions. GTK derives the action from the property's type
+ * (gtkwidget.c determine_type): a boolean is a toggle with no parameter, an
+ * int, uint, float, double, string or enum is set by a parameter of the same
+ * type - an enum as its nick - and the state is the current value. The
+ * stand-in is a stateful GSimpleAction carrying that state. Activating it
+ * goes through the owner widget like any other stand-in, so GTK sets the
+ * property; the stand-in's state follows the property's notify signal.
+ */
+static GVariant *property_state(GObject *object, GParamSpec *pspec)
+{
+	GValue value = G_VALUE_INIT;
+	GVariant *state = NULL;
+	GType type = pspec->value_type;
+
+	p_g_value_init(&value, type);
+	p_g_object_get_property(object, pspec->name, &value);
+
+	if (type == G_TYPE_BOOLEAN) {
+		state = p_g_variant_new_boolean(p_g_value_get_boolean(&value));
+	} else if (type == G_TYPE_INT) {
+		state = p_g_variant_new_int32(p_g_value_get_int(&value));
+	} else if (type == G_TYPE_UINT) {
+		state = p_g_variant_new_uint32(p_g_value_get_uint(&value));
+	} else if (type == G_TYPE_DOUBLE) {
+		state = p_g_variant_new_double(p_g_value_get_double(&value));
+	} else if (type == G_TYPE_FLOAT) {
+		state = p_g_variant_new_double(p_g_value_get_float(&value));
+	} else if (type == G_TYPE_STRING) {
+		const char *str = p_g_value_get_string(&value);
+		state = p_g_variant_new_string(str != NULL ? str : "");
+	} else if (p_g_type_fundamental(type) == G_TYPE_ENUM) {
+		GEnumClass *klass = p_g_type_class_ref(type);
+		GEnumValue *ev = p_g_enum_get_value(klass,
+						    p_g_value_get_enum(&value));
+		state = p_g_variant_new_string(ev != NULL ? ev->value_nick : "");
+		p_g_type_class_unref(klass);
+	}
+
+	p_g_value_unset(&value);
+	return state; /* floating, or NULL for a type GTK itself rejects */
+}
+
+static void property_notified(GObject *holder, GParamSpec *pspec,
+			      gpointer action)
+{
+	GVariant *state = property_state(holder, pspec);
+
+	if (state != NULL)
+		p_g_simple_action_set_state(action, state);
+}
+
+/* A change of state asked for over D-Bus (org.gtk.Actions.SetState). Left to
+   itself GSimpleAction would just store it; route it to the property the same
+   way activation does, and let the notify bring the new state back. */
+static void proxy_change_state(GSimpleAction *action, GVariant *value,
+			       gpointer data)
+{
+	struct proxy *proxy = data;
+
+	if (proxy->owner == NULL)
+		return;
+
+	if (p_g_variant_is_of_type(value, G_VARIANT_TYPE_BOOLEAN)) {
+		GVariant *now = p_g_action_get_state((GAction *)action);
+		gboolean differs = now == NULL ||
+			p_g_variant_get_boolean(now) != p_g_variant_get_boolean(value);
+		if (now != NULL)
+			p_g_variant_unref(now);
+		if (differs)
+			p_gtk_widget_activate_action_variant(proxy->owner,
+							     proxy->name, NULL);
+	} else {
+		p_gtk_widget_activate_action_variant(proxy->owner, proxy->name,
+						     value);
+	}
 }
 
 /* The name the exported item should use for @name: a stand-in in @map when
@@ -578,7 +706,8 @@ static GtkWidget *find_class_action(GtkWidget *widget, const char *name,
 static gchar *proxy_for(const char *name, GtkWidget *owner, GActionMap *map)
 {
 	const GVariantType *ptype = NULL;
-	GtkWidget *holder = find_class_action(owner, name, &ptype);
+	const char *property = NULL;
+	GtkWidget *holder = find_class_action(owner, name, &ptype, &property);
 
 	if (holder == NULL) {
 		if (strncmp(name, "app.", 4) != 0 &&
@@ -605,10 +734,46 @@ static gchar *proxy_for(const char *name, GtkWidget *owner, GActionMap *map)
 		p_g_object_add_weak_pointer((GObject *)holder,
 					    (gpointer *)&proxy->holder);
 
-		GSimpleAction *action = p_g_simple_action_new(local, ptype);
+		GParamSpec *pspec = NULL;
+		GVariant *state = NULL;
+		if (property != NULL) {
+			pspec = p_g_object_class_find_property(
+				(GObjectClass *)((GTypeInstance *)holder)->g_class,
+				property);
+			if (pspec != NULL)
+				state = property_state((GObject *)holder, pspec);
+			if (state == NULL) {
+				note("%s: property %s has no usable state, not proxied",
+				     name, property);
+				p_g_object_remove_weak_pointer(
+					(GObject *)owner, (gpointer *)&proxy->owner);
+				p_g_object_remove_weak_pointer(
+					(GObject *)holder, (gpointer *)&proxy->holder);
+				p_g_free(proxy->name);
+				free(proxy);
+				p_g_free(local);
+				return NULL;
+			}
+		}
+
+		GSimpleAction *action =
+			state != NULL
+				? p_g_simple_action_new_stateful(local, ptype, state)
+				: p_g_simple_action_new(local, ptype);
 		p_g_signal_connect_data(action, "activate",
 					(GCallback)proxy_activate, proxy,
 					proxy_free, 0);
+		if (state != NULL) {
+			p_g_signal_connect_data(action, "change-state",
+						(GCallback)proxy_change_state,
+						proxy, NULL, 0);
+			/* Disconnected by GObject when the action goes. */
+			char signal[256];
+			snprintf(signal, sizeof signal, "notify::%s", pspec->name);
+			p_g_signal_connect_object(holder, signal,
+						  (GCallback)property_notified,
+						  action, 0);
+		}
 
 		/* Start from whatever the application has set so far. */
 		char key[256];
@@ -622,7 +787,8 @@ static gchar *proxy_for(const char *name, GtkWidget *owner, GActionMap *map)
 
 		p_g_action_map_add_action(map, (GAction *)action);
 		p_g_object_unref(action);
-		note("%s proxied as win.%s%s", name, local,
+		note("%s proxied as win.%s%s%s", name, local,
+		     state != NULL ? " with state" : "",
 		     enabled ? "" : ", disabled");
 	}
 

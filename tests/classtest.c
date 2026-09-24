@@ -4,14 +4,17 @@
  *
  *   win.class-hello   class action on the window class      -> should be proxied
  *   win.class-param   class action with a string parameter -> should be proxied
- *   win.class-toggle  property action (boolean property)   -> left alone
+ *   win.class-toggle  property action (boolean property)   -> stateful, a check item
+ *   win.class-mode    property action (string property),
+ *                     two items with targets "one", "two"  -> stateful, radio items
  *   inner.hello       group inserted on a sub-widget       -> left alone
  *   win.map-hello     ordinary entry in the window's map   -> exported as is
  *   win.class-off     class action disabled in init        -> proxied, disabled
  *
  * win.toggle-hello, an ordinary exported action, flips win.class-hello's
  * enabled state with gtk_widget_action_set_enabled(), so a test can check
- * that the stand-in follows it.
+ * that the stand-in follows it. win.flip-toggle sets the "toggle" property
+ * from inside the application, for the same check on state.
  *
  * Every activation prints one line to stdout, so a test can activate over
  * D-Bus and read what happened.
@@ -26,11 +29,12 @@ G_DECLARE_FINAL_TYPE(TestWindow, test_window, TEST, WINDOW, GtkApplicationWindow
 struct _TestWindow {
 	GtkApplicationWindow parent;
 	gboolean toggle;
+	char *mode;
 };
 
 G_DEFINE_TYPE(TestWindow, test_window, GTK_TYPE_APPLICATION_WINDOW)
 
-enum { PROP_TOGGLE = 1 };
+enum { PROP_TOGGLE = 1, PROP_MODE };
 
 static void say(const char *what)
 {
@@ -68,13 +72,31 @@ static void inner_hello(GSimpleAction *a, GVariant *p, gpointer d)
 
 static void set_property(GObject *o, guint id, const GValue *v, GParamSpec *ps)
 {
-	TEST_WINDOW(o)->toggle = g_value_get_boolean(v);
-	g_print("TOGGLE %d\n", TEST_WINDOW(o)->toggle);
+	TestWindow *self = TEST_WINDOW(o);
+
+	if (id == PROP_TOGGLE) {
+		self->toggle = g_value_get_boolean(v);
+		g_print("TOGGLE %d\n", self->toggle);
+	} else {
+		g_free(self->mode);
+		self->mode = g_value_dup_string(v);
+		g_print("MODE %s\n", self->mode);
+	}
 }
 
 static void get_property(GObject *o, guint id, GValue *v, GParamSpec *ps)
 {
-	g_value_set_boolean(v, TEST_WINDOW(o)->toggle);
+	TestWindow *self = TEST_WINDOW(o);
+
+	if (id == PROP_TOGGLE)
+		g_value_set_boolean(v, self->toggle);
+	else
+		g_value_set_string(v, self->mode);
+}
+
+static void flip_toggle(GSimpleAction *a, GVariant *p, gpointer self)
+{
+	g_object_set(self, "toggle", !TEST_WINDOW(self)->toggle, NULL);
 }
 
 static void test_window_class_init(TestWindowClass *klass)
@@ -88,11 +110,15 @@ static void test_window_class_init(TestWindowClass *klass)
 		oc, PROP_TOGGLE,
 		g_param_spec_boolean("toggle", NULL, NULL, FALSE,
 				     G_PARAM_READWRITE));
+	g_object_class_install_property(
+		oc, PROP_MODE,
+		g_param_spec_string("mode", NULL, NULL, "one", G_PARAM_READWRITE));
 
 	gtk_widget_class_install_action(wc, "win.class-hello", NULL, class_hello);
 	gtk_widget_class_install_action(wc, "win.class-param", "s", class_param);
 	gtk_widget_class_install_action(wc, "win.class-off", NULL, class_hello);
 	gtk_widget_class_install_property_action(wc, "win.class-toggle", "toggle");
+	gtk_widget_class_install_property_action(wc, "win.class-mode", "mode");
 }
 
 static void test_window_init(TestWindow *self)
@@ -100,14 +126,18 @@ static void test_window_init(TestWindow *self)
 	static const GActionEntry entries[] = {
 		{ .name = "map-hello", .activate = map_hello },
 		{ .name = "toggle-hello", .activate = toggle_hello },
+		{ .name = "flip-toggle", .activate = flip_toggle },
 	};
-	g_action_map_add_action_entries(G_ACTION_MAP(self), entries, 2, self);
+	g_action_map_add_action_entries(G_ACTION_MAP(self), entries, 3, self);
+	self->mode = g_strdup("one");
 	gtk_widget_action_set_enabled(GTK_WIDGET(self), "win.class-off", FALSE);
 
 	GMenu *menu = g_menu_new();
 	g_menu_append(menu, "Class hello", "win.class-hello");
 	g_menu_append(menu, "Class param", "win.class-param::abc");
 	g_menu_append(menu, "Class toggle", "win.class-toggle");
+	g_menu_append(menu, "Mode one", "win.class-mode::one");
+	g_menu_append(menu, "Mode two", "win.class-mode::two");
 	g_menu_append(menu, "Inner hello", "inner.hello");
 	g_menu_append(menu, "Map hello", "win.map-hello");
 	g_menu_append(menu, "Class off", "win.class-off");
