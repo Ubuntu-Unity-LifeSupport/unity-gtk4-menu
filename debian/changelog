@@ -1,3 +1,19 @@
+unity-gtk4-menu (0.6) resolute; urgency=medium
+
+  * Reach gjs and PyGObject applications. They do not link GTK4; GObject
+    Introspection loads it after our constructor has run, so the library
+    found no GTK4 and did nothing - gnome-characters, gnome-weather,
+    gnome-tweaks, showtime and gnome-music had no global menu. Intercept
+    g_module_symbol(), through which introspection resolves every function
+    before calling it, and hook GTK4 at the first gtk_ or adw_ lookup, when
+    it is mapped but none of its classes is initialised yet. The lookup is
+    handed on unchanged, and the hook runs after it: gtk-nocsd, also
+    preloaded in Ubuntu Unity, intercepts the same function and only fetches
+    its GTK types there - hooking first made it miss them, and
+    gnome-characters aborted.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Thu, 24 Sep 2026 00:10:00 +0000
+
 unity-gtk4-menu (0.5) resolute; urgency=medium
 
   * Export the window's main menu rather than the first menu button found.

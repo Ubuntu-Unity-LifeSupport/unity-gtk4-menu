@@ -21,7 +21,9 @@
  *     Gdk-ERROR: gdk_display_manager_get() was called before gtk_init()
  *
  * So every symbol is resolved with dlsym at runtime and the library does
- * nothing unless GTK4 is already loaded in this process. The headers are
+ * nothing until GTK4 is loaded in this process by someone else - at startup
+ * for a C application, through GObject Introspection for gjs and Python (see
+ * g_module_symbol() below). The headers are
  * included for their type and struct definitions only - a header costs
  * nothing, a call costs a NEEDED entry. Never call a GTK or GLib function
  * directly here, and never use the GTK_IS_* or GTK_TYPE_* macros: they expand
@@ -41,6 +43,7 @@
 
 #include <gtk/gtk.h>
 #include <gio/gdesktopappinfo.h>
+#include <gmodule.h>
 
 #define SHIM_SCHEMA "com.ubuntu-unity.gtk4-menu"
 
@@ -773,12 +776,53 @@ static int wanted_here(void)
 	return 1;
 }
 
-__attribute__((constructor)) static void shim_init(void)
-{
-	debug_on = getenv("UNITY_GTK4_MENU_DEBUG") != NULL;
+/*
+ * Where GTK4 comes from decides when we can hook it.
+ *
+ * A C application links libgtk-4.so.1, so GTK4 is mapped before any
+ * constructor runs and shim_init() finds it at once.
+ *
+ * A gjs or PyGObject application does not link GTK at all. GObject
+ * Introspection loads it later, when the script imports Gtk, and resolves
+ * each function through g_module_symbol() before calling it. So the first
+ * g_module_symbol() for a gtk_ or adw_ name is the moment GTK4 is mapped but
+ * none of its classes has been initialised yet - the same state the
+ * constructor sees in a C application. We intercept it for that alone, and
+ * always hand the lookup on unchanged. gtk-nocsd, which Ubuntu Unity also
+ * preloads, intercepts the same function for the same reason; with both
+ * loaded, ours runs first and RTLD_NEXT reaches gtk-nocsd's.
+ */
+enum { UNDECIDED, NOT_WANTED, WAITING, HOOKING, DONE };
+static int state = UNDECIDED;
 
-	if (!wanted_here())
+static int wanted(void)
+{
+	if (state == UNDECIDED) {
+		debug_on = getenv("UNITY_GTK4_MENU_DEBUG") != NULL;
+		state = wanted_here() ? WAITING : NOT_WANTED;
+	}
+	return state != NOT_WANTED;
+}
+
+static void hook_class(GType type, void (**real)(GtkWidget *),
+		       void (*shim)(GtkWidget *), const char *name)
+{
+	GtkWidgetClass *klass = (GtkWidgetClass *)p_g_type_class_ref(type);
+
+	if (klass == NULL || klass->realize == shim_window_realize ||
+	    klass->realize == shim_app_window_realize)
 		return;
+	*real = klass->realize;
+	klass->realize = shim;
+	note("hooked %s::realize", name);
+}
+
+/* Hook GTK4 if it is mapped. Returns 0 while it is not, so the caller may try
+   again later; anything else is final. */
+static int try_hook(const char *when)
+{
+	if (!__sync_bool_compare_and_swap(&state, WAITING, HOOKING))
+		return 1;
 
 	/*
 	 * RTLD_NOLOAD is the whole point: it returns a handle only if the
@@ -788,9 +832,12 @@ __attribute__((constructor)) static void shim_init(void)
 	 */
 	void *gtk = dlopen("libgtk-4.so.1", RTLD_LAZY | RTLD_NOLOAD);
 	if (gtk == NULL) {
-		note("GTK4 is not loaded in this process, doing nothing");
-		return;
+		state = WAITING;
+		return 0;
 	}
+
+	state = DONE;
+	note("GTK4 found %s", when);
 
 	void *gobj = dlopen("libgobject-2.0.so.0", RTLD_LAZY | RTLD_NOLOAD);
 	void *glib = dlopen("libglib-2.0.so.0", RTLD_LAZY | RTLD_NOLOAD);
@@ -798,28 +845,49 @@ __attribute__((constructor)) static void shim_init(void)
 
 	if (gobj == NULL || glib == NULL || gio == NULL) {
 		note("GTK4 is present but GLib is not, which should not happen");
-		return;
+		return 1;
 	}
 
 	if (!resolve_all(gtk, gobj, glib, gio)) {
 		note("could not resolve every symbol, doing nothing");
-		return;
+		return 1;
 	}
 
-	GtkWidgetClass *window_class =
-		(GtkWidgetClass *)p_g_type_class_ref(type_window);
-	if (window_class != NULL) {
-		real_window_realize = window_class->realize;
-		window_class->realize = shim_window_realize;
-		note("hooked GtkWindow::realize");
-	}
+	hook_class(type_window, &real_window_realize, shim_window_realize,
+		   "GtkWindow");
+	hook_class(type_app_window, &real_app_window_realize,
+		   shim_app_window_realize, "GtkApplicationWindow");
+	return 1;
+}
 
-	GtkWidgetClass *app_window_class =
-		(GtkWidgetClass *)p_g_type_class_ref(type_app_window);
-	if (app_window_class != NULL &&
-	    app_window_class->realize != shim_window_realize) {
-		real_app_window_realize = app_window_class->realize;
-		app_window_class->realize = shim_app_window_realize;
-		note("hooked GtkApplicationWindow::realize");
-	}
+__attribute__((constructor)) static void shim_init(void)
+{
+	if (wanted() && !try_hook("at load"))
+		note("GTK4 is not loaded in this process yet");
+}
+
+gboolean g_module_symbol(GModule *module, const gchar *symbol_name,
+			 gpointer *symbol)
+{
+	static gboolean (*real)(GModule *, const gchar *, gpointer *);
+
+	if (real == NULL)
+		*(void **)(&real) = dlsym(RTLD_NEXT, "g_module_symbol");
+
+	gboolean found = real != NULL ? real(module, symbol_name, symbol) : FALSE;
+
+	/* After the lookup, not before: gtk-nocsd fills in its GTK and
+	   libadwaita types in its own g_module_symbol, the first time it sees
+	   GTK loaded there. Our hook initialises GtkWindow's class, which
+	   registers types through its g_type_register_static_simple instead;
+	   if that comes first, gtk-nocsd notices GTK there, never fetches the
+	   types, and later takes an AdwApplicationWindow for a plain window -
+	   gnome-characters aborted on exactly that. The symbol is only
+	   resolved, not yet called, so no class is initialised by then. */
+	if (state == WAITING && symbol_name != NULL &&
+	    (strncmp(symbol_name, "gtk_", 4) == 0 ||
+	     strncmp(symbol_name, "adw_", 4) == 0))
+		try_hook("through GObject Introspection");
+
+	return found;
 }

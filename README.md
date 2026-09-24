@@ -34,6 +34,16 @@ file of the same name:
     # one user
     touch ~/.config/environment.d/60-unity-gtk4-menu.conf
 
+## gjs and Python applications
+
+A gjs or PyGObject application does not link GTK4; GObject Introspection
+loads it when the script imports Gtk, long after the library's constructor has
+looked for it. So the library also intercepts `g_module_symbol()`, through
+which introspection resolves every GTK function before calling it, and hooks
+GTK4 at the first `gtk_` or `adw_` lookup. The lookup itself is passed on
+unchanged. gtk-nocsd, which Ubuntu Unity preloads as well, intercepts the same
+function; with this library first in `LD_PRELOAD`, both see every call.
+
 ## Which menu
 
 A window often has several menu buttons. The library collects all of them and
