@@ -1,3 +1,21 @@
+unity-gtk4-menu (0.7) resolute; urgency=medium
+
+  * Give stand-ins for class actions the enabled state of the action they
+    stand for, and follow it. GTK has no getter for it, only
+    gtk_widget_action_set_enabled(), so that is intercepted - through the
+    PLT for C and Rust applications, through g_module_symbol() for gjs and
+    Python - every call remembered on the widget, and applied to the
+    stand-in when it is created and whenever it changes. Items that were
+    always shown enabled now grey out when the application disables them,
+    and items the application hides when disabled (hidden-when) are hidden
+    in the global menu too: gnome-text-editor no longer lists both
+    "Fullscreen" and "Leave Fullscreen", and loupe greys out Print and
+    Delete until an image is open.
+  * tests/classtest.c: a class action disabled in init and one that can be
+    toggled over D-Bus. tests/gjstest.js: the same for gjs.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Thu, 24 Sep 2026 08:30:00 +0000
+
 unity-gtk4-menu (0.6) resolute; urgency=medium
 
   * Reach gjs and PyGObject applications. They do not link GTK4; GObject

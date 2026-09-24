@@ -125,6 +125,9 @@ DECL(GtkWidget *, gtk_widget_get_parent, (GtkWidget *));
 DECL(gboolean, gtk_menu_button_get_primary, (GtkMenuButton *));
 DECL(gboolean, gtk_widget_is_visible, (GtkWidget *));
 DECL(gboolean, gtk_widget_get_child_visible, (GtkWidget *));
+DECL(void, g_object_set_data, (GObject *, const gchar *, gpointer));
+DECL(gpointer, g_object_get_data, (GObject *, const gchar *));
+DECL(void, g_simple_action_set_enabled, (GSimpleAction *, gboolean));
 DECL(gboolean, gtk_widget_class_query_action,
      (GtkWidgetClass *, guint, GType *, const char **, const GVariantType **,
       const char **));
@@ -199,6 +202,9 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(gtk, gtk_widget_get_parent);
 	RESOLVE(gtk, gtk_widget_is_visible);
 	RESOLVE(gtk, gtk_widget_get_child_visible);
+	RESOLVE(gobj, g_object_set_data);
+	RESOLVE(gobj, g_object_get_data);
+	RESOLVE(gio, g_simple_action_set_enabled);
 	RESOLVE(gtk, gtk_widget_class_query_action);
 	RESOLVE(gtk, gtk_widget_activate_action_variant);
 	RESOLVE(gio, g_simple_action_new);
@@ -482,16 +488,29 @@ static gchar *menu_label(GtkApplication *app)
  * with a prefix other than app. or win., which usually come from a group
  * inserted on a sub-widget and cannot be enumerated through public API.
  *
- * The stand-in is always enabled: GTK has no public getter for a class
- * action's enabled state. Activating a disabled one does nothing, as in the
- * application.
+ * GTK has no public getter for a class action's enabled state, only the
+ * setter gtk_widget_action_set_enabled(). So the setter is intercepted (see
+ * the end of this file), every call is remembered on the widget, and a
+ * stand-in takes its enabled state from there when created and follows it
+ * afterwards. Calls GTK makes internally do not pass through it; those are
+ * GTK's own widgets' actions, which header bar menus do not use.
  */
 #define PROXY_PREFIX "unity-gtk4-menu-"
 
 struct proxy {
-	GtkWidget *owner; /* weak */
+	GtkWidget *owner;  /* weak; the menu button, activation starts here */
+	GtkWidget *holder; /* weak; the widget whose class has the action */
 	gchar *name;
 };
+
+#define ENABLED_KEY "unity-gtk4-menu-enabled:"
+#define PROXY_KEY "unity-gtk4-menu-proxy:"
+
+static void make_key(char *buf, size_t size, const char *prefix,
+		     const char *name)
+{
+	snprintf(buf, size, "%s%s", prefix, name);
+}
 
 static void proxy_activate(GSimpleAction *action, GVariant *parameter,
 			   gpointer data)
@@ -513,13 +532,21 @@ static void proxy_free(gpointer data, GClosure *closure)
 	if (proxy->owner != NULL)
 		p_g_object_remove_weak_pointer((GObject *)proxy->owner,
 					       (gpointer *)&proxy->owner);
+	if (proxy->holder != NULL) {
+		char key[256];
+		make_key(key, sizeof key, PROXY_KEY, proxy->name);
+		p_g_object_set_data((GObject *)proxy->holder, key, NULL);
+		p_g_object_remove_weak_pointer((GObject *)proxy->holder,
+					       (gpointer *)&proxy->holder);
+	}
 	p_g_free(proxy->name);
 	free(proxy);
 }
 
-/* Returns 1 for a stateless class action on @widget or an ancestor. */
-static int find_class_action(GtkWidget *widget, const char *name,
-			     const GVariantType **parameter_type)
+/* Returns the widget, @widget or an ancestor, whose class has @name as a
+   stateless action, or NULL. */
+static GtkWidget *find_class_action(GtkWidget *widget, const char *name,
+				    const GVariantType **parameter_type)
 {
 	for (; widget != NULL; widget = p_gtk_widget_get_parent(widget)) {
 		GtkWidgetClass *klass =
@@ -537,13 +564,13 @@ static int find_class_action(GtkWidget *widget, const char *name,
 			if (property_name != NULL) {
 				note("%s is a property action, not proxied",
 				     name);
-				return 0;
+				return NULL;
 			}
 			*parameter_type = ptype;
-			return 1;
+			return widget;
 		}
 	}
-	return 0;
+	return NULL;
 }
 
 /* The name the exported item should use for @name: a stand-in in @map when
@@ -551,8 +578,9 @@ static int find_class_action(GtkWidget *widget, const char *name,
 static gchar *proxy_for(const char *name, GtkWidget *owner, GActionMap *map)
 {
 	const GVariantType *ptype = NULL;
+	GtkWidget *holder = find_class_action(owner, name, &ptype);
 
-	if (!find_class_action(owner, name, &ptype)) {
+	if (holder == NULL) {
 		if (strncmp(name, "app.", 4) != 0 &&
 		    strncmp(name, "win.", 4) != 0)
 			note("%s has a prefix the global menu cannot reach",
@@ -570,17 +598,32 @@ static gchar *proxy_for(const char *name, GtkWidget *owner, GActionMap *map)
 	if (p_g_action_map_lookup_action(map, local) == NULL) {
 		struct proxy *proxy = calloc(1, sizeof *proxy);
 		proxy->owner = owner;
+		proxy->holder = holder;
 		proxy->name = p_g_strdup(name);
 		p_g_object_add_weak_pointer((GObject *)owner,
 					    (gpointer *)&proxy->owner);
+		p_g_object_add_weak_pointer((GObject *)holder,
+					    (gpointer *)&proxy->holder);
 
 		GSimpleAction *action = p_g_simple_action_new(local, ptype);
 		p_g_signal_connect_data(action, "activate",
 					(GCallback)proxy_activate, proxy,
 					proxy_free, 0);
+
+		/* Start from whatever the application has set so far. */
+		char key[256];
+		make_key(key, sizeof key, ENABLED_KEY, name);
+		gboolean enabled = p_g_object_get_data((GObject *)holder, key) !=
+				   GINT_TO_POINTER(2);
+		p_g_simple_action_set_enabled(action, enabled);
+
+		make_key(key, sizeof key, PROXY_KEY, name);
+		p_g_object_set_data((GObject *)holder, key, action);
+
 		p_g_action_map_add_action(map, (GAction *)action);
 		p_g_object_unref(action);
-		note("%s proxied as win.%s", name, local);
+		note("%s proxied as win.%s%s", name, local,
+		     enabled ? "" : ", disabled");
 	}
 
 	gchar *exported = p_g_strconcat("win.", local, NULL);
@@ -794,6 +837,7 @@ static int wanted_here(void)
  */
 enum { UNDECIDED, NOT_WANTED, WAITING, HOOKING, DONE };
 static int state = UNDECIDED;
+static int ready; /* every symbol resolved */
 
 static int wanted(void)
 {
@@ -853,6 +897,7 @@ static int try_hook(const char *when)
 		return 1;
 	}
 
+	ready = 1;
 	hook_class(type_window, &real_window_realize, shim_window_realize,
 		   "GtkWindow");
 	hook_class(type_app_window, &real_app_window_realize,
@@ -889,5 +934,40 @@ gboolean g_module_symbol(GModule *module, const gchar *symbol_name,
 	     strncmp(symbol_name, "adw_", 4) == 0))
 		try_hook("through GObject Introspection");
 
+	/* An introspected application calls GTK through the pointer returned
+	   here, never through the PLT, so hand it our setter directly. */
+	if (found && ready && symbol != NULL &&
+	    strcmp(symbol_name, "gtk_widget_action_set_enabled") == 0)
+		*symbol = (gpointer)gtk_widget_action_set_enabled;
+
 	return found;
+}
+
+/*
+ * The only way to learn a class action's enabled state. A C or Rust
+ * application reaches this through the PLT; a gjs or Python one through the
+ * g_module_symbol() above. The real setter always runs first and unchanged.
+ */
+void gtk_widget_action_set_enabled(GtkWidget *widget, const char *action_name,
+				   gboolean enabled)
+{
+	static void (*real)(GtkWidget *, const char *, gboolean);
+
+	if (real == NULL)
+		*(void **)(&real) = dlsym(RTLD_NEXT, "gtk_widget_action_set_enabled");
+	if (real != NULL)
+		real(widget, action_name, enabled);
+
+	if (!ready || widget == NULL || action_name == NULL)
+		return;
+
+	char key[256];
+	make_key(key, sizeof key, ENABLED_KEY, action_name);
+	p_g_object_set_data((GObject *)widget, key,
+			    GINT_TO_POINTER(enabled ? 1 : 2));
+
+	make_key(key, sizeof key, PROXY_KEY, action_name);
+	GSimpleAction *proxy = p_g_object_get_data((GObject *)widget, key);
+	if (proxy != NULL)
+		p_g_simple_action_set_enabled(proxy, enabled);
 }

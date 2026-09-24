@@ -7,6 +7,11 @@
  *   win.class-toggle  property action (boolean property)   -> left alone
  *   inner.hello       group inserted on a sub-widget       -> left alone
  *   win.map-hello     ordinary entry in the window's map   -> exported as is
+ *   win.class-off     class action disabled in init        -> proxied, disabled
+ *
+ * win.toggle-hello, an ordinary exported action, flips win.class-hello's
+ * enabled state with gtk_widget_action_set_enabled(), so a test can check
+ * that the stand-in follows it.
  *
  * Every activation prints one line to stdout, so a test can activate over
  * D-Bus and read what happened.
@@ -47,6 +52,15 @@ static void map_hello(GSimpleAction *a, GVariant *p, gpointer d)
 	say("win.map-hello");
 }
 
+static void toggle_hello(GSimpleAction *a, GVariant *p, gpointer self)
+{
+	static gboolean enabled = TRUE;
+
+	enabled = !enabled;
+	gtk_widget_action_set_enabled(GTK_WIDGET(self), "win.class-hello", enabled);
+	g_print("CLASS-HELLO %s\n", enabled ? "enabled" : "disabled");
+}
+
 static void inner_hello(GSimpleAction *a, GVariant *p, gpointer d)
 {
 	say("inner.hello");
@@ -77,6 +91,7 @@ static void test_window_class_init(TestWindowClass *klass)
 
 	gtk_widget_class_install_action(wc, "win.class-hello", NULL, class_hello);
 	gtk_widget_class_install_action(wc, "win.class-param", "s", class_param);
+	gtk_widget_class_install_action(wc, "win.class-off", NULL, class_hello);
 	gtk_widget_class_install_property_action(wc, "win.class-toggle", "toggle");
 }
 
@@ -84,8 +99,10 @@ static void test_window_init(TestWindow *self)
 {
 	static const GActionEntry entries[] = {
 		{ .name = "map-hello", .activate = map_hello },
+		{ .name = "toggle-hello", .activate = toggle_hello },
 	};
-	g_action_map_add_action_entries(G_ACTION_MAP(self), entries, 1, self);
+	g_action_map_add_action_entries(G_ACTION_MAP(self), entries, 2, self);
+	gtk_widget_action_set_enabled(GTK_WIDGET(self), "win.class-off", FALSE);
 
 	GMenu *menu = g_menu_new();
 	g_menu_append(menu, "Class hello", "win.class-hello");
@@ -93,6 +110,7 @@ static void test_window_init(TestWindow *self)
 	g_menu_append(menu, "Class toggle", "win.class-toggle");
 	g_menu_append(menu, "Inner hello", "inner.hello");
 	g_menu_append(menu, "Map hello", "win.map-hello");
+	g_menu_append(menu, "Class off", "win.class-off");
 
 	GtkWidget *button = gtk_menu_button_new();
 	gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(button), G_MENU_MODEL(menu));

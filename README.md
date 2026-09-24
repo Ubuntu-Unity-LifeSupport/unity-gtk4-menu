@@ -74,11 +74,11 @@ For each such item the exported copy of the menu points at a stand-in added to
 the window's action map, named `unity-gtk4-menu-<original name>`, which
 activates the original from the menu button. Known limits:
 
-- A stand-in is always shown enabled. GTK has no public getter for a class
-  action's enabled state; activating a disabled one does nothing, as it would
-  in the application. Items the application hides while their action is
-  disabled (`hidden-when="action-disabled"`) are therefore always shown -
-  gnome-text-editor lists both "Fullscreen" and "Leave Fullscreen".
+- A stand-in follows the enabled state the application sets with
+  `gtk_widget_action_set_enabled()` - GTK has no getter, so the library
+  intercepts the setter and remembers each call on the widget. Calls GTK
+  makes inside itself are not seen; they concern GTK's own widgets, which
+  header bar menus do not use.
 - Property actions (`gtk_widget_class_install_property_action()`) are left
   alone: they carry state a plain stand-in cannot mirror.
 - Actions with a prefix other than `app.` or `win.` usually come from a group
@@ -97,6 +97,8 @@ shows at once which one it hits.
 `UNITY_GTK4_MENU_LABEL=app|generic` overrides the setting.
 `UNITY_GTK4_MENU_FORCE=1` skips the check that the session is Unity.
 
-`tests/classtest.c` is a minimal application with one item of each kind above;
-every activation prints a line, so a test can activate the exported actions
-with `gdbus call ... org.gtk.Actions.Activate` and read the result.
+`tests/classtest.c` is a minimal application with one item of each kind above,
+plus a class action disabled at start and one that `win.toggle-hello` switches
+on and off; every activation prints a line, so a test can drive it with
+`gdbus call ... org.gtk.Actions.Activate` and read the result.
+`tests/gjstest.js` does the same for gjs (`gjs -m tests/gjstest.js`).
