@@ -999,7 +999,7 @@ static int wanted_here(void)
  * constructor sees in a C application. We intercept it for that alone, and
  * always hand the lookup on unchanged. gtk-nocsd, which Ubuntu Unity also
  * preloads, intercepts the same function for the same reason; with both
- * loaded, ours runs first and RTLD_NEXT reaches gtk-nocsd's.
+ * loaded, ours runs first and hands the lookup on to gtk-nocsd's.
  */
 enum { UNDECIDED, NOT_WANTED, WAITING, HOOKING, DONE };
 static int state = UNDECIDED;
@@ -1077,13 +1077,62 @@ __attribute__((constructor)) static void shim_init(void)
 		note("GTK4 is not loaded in this process yet");
 }
 
+/*
+ * The next definition of a function we wrap, in load order after ours.
+ *
+ * Not through the dlsym we link against: gtk-nocsd replaces dlsym. Its
+ * replacement answers "g_module_symbol" with the address of its own
+ * g_module_symbol, and when gtk-nocsd is built without -Bsymbolic-functions
+ * (upstream's plain make; Ubuntu's build flags add it) that address is taken
+ * through its GOT - so it is ours, and we would call ourselves until the
+ * stack runs out, in either LD_PRELOAD order. And unless its dlsym ends in a
+ * tail call (-O0 again), glibc counts RTLD_NEXT from gtk-nocsd rather than
+ * from us, so with gtk-nocsd first the "next" gtk_widget_action_set_enabled
+ * is ours again.
+ *
+ * glibc's own dlsym is versioned and gtk-nocsd's is not, so asking dlvsym
+ * for dlsym@GLIBC_2.34 finds glibc's; called from here, its RTLD_NEXT counts
+ * from us. (dlvsym straight for the wrapped name does not work: every
+ * object that links glibc has a version table, and glibc then refuses an
+ * unversioned symbol under any version asked.) The answer is still checked
+ * against ourselves: the one that must never come back. Our issue #1; the
+ * measurement is in unity-distro's docs/research/nocsd-order/.
+ */
+static void *next_symbol(const char *name, void *self)
+{
+	static void *(*libc_dlsym)(void *, const char *);
+
+	if (libc_dlsym == NULL)
+		*(void **)(&libc_dlsym) = dlvsym(RTLD_DEFAULT, "dlsym",
+						 "GLIBC_2.34");
+	if (libc_dlsym == NULL)
+		*(void **)(&libc_dlsym) = dlvsym(RTLD_DEFAULT, "dlsym",
+						 "GLIBC_2.2.5");
+
+	void *next = libc_dlsym != NULL ? libc_dlsym(RTLD_NEXT, name)
+					: dlsym(RTLD_NEXT, name);
+	if (next == self) {
+		note("the next %s is our own; not calling it", name);
+		return NULL;
+	}
+	return next;
+}
+
+/* Our own entry points, bound locally whatever the link flags. */
+extern __typeof__(g_module_symbol) self_g_module_symbol
+	__attribute__((alias("g_module_symbol"), visibility("hidden")));
+extern __typeof__(gtk_widget_action_set_enabled) self_action_set_enabled
+	__attribute__((alias("gtk_widget_action_set_enabled"),
+		       visibility("hidden")));
+
 gboolean g_module_symbol(GModule *module, const gchar *symbol_name,
 			 gpointer *symbol)
 {
 	static gboolean (*real)(GModule *, const gchar *, gpointer *);
 
 	if (real == NULL)
-		*(void **)(&real) = dlsym(RTLD_NEXT, "g_module_symbol");
+		*(void **)(&real) = next_symbol("g_module_symbol",
+						  (void *)self_g_module_symbol);
 
 	gboolean found = real != NULL ? real(module, symbol_name, symbol) : FALSE;
 
@@ -1120,7 +1169,8 @@ void gtk_widget_action_set_enabled(GtkWidget *widget, const char *action_name,
 	static void (*real)(GtkWidget *, const char *, gboolean);
 
 	if (real == NULL)
-		*(void **)(&real) = dlsym(RTLD_NEXT, "gtk_widget_action_set_enabled");
+		*(void **)(&real) = next_symbol("gtk_widget_action_set_enabled",
+						  (void *)self_action_set_enabled);
 	if (real != NULL)
 		real(widget, action_name, enabled);
 

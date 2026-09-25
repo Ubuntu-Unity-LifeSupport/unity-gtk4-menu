@@ -42,7 +42,36 @@ looked for it. So the library also intercepts `g_module_symbol()`, through
 which introspection resolves every GTK function before calling it, and hooks
 GTK4 at the first `gtk_` or `adw_` lookup. The lookup itself is passed on
 unchanged. gtk-nocsd, which Ubuntu Unity preloads as well, intercepts the same
-function; with this library first in `LD_PRELOAD`, both see every call.
+function; see the next section.
+
+## Next to gtk-nocsd
+
+Ubuntu Unity's session preloads both libraries, this one first
+(`60-unity-gtk4-menu.conf` is applied after `50-gtk-nocsd.conf`, and each
+prepends itself). Measured on 26.04 with gtk-nocsd 4.8 as Ubuntu builds it and
+with gtk-nocsd's git head built by its own `make`, in both orders:
+
+- This library first - the session's order: no crash, global menu for C, gjs
+  and Python applications.
+- gtk-nocsd first: no crash, but gjs and Python applications get no global
+  menu. gtk-nocsd resolves the real `g_module_symbol()` through libgmodule's
+  handle, so a library after it never sees the lookups. C applications are
+  not affected.
+- Up to 0.8 this library crashed most GTK4 applications, in either order,
+  next to a gtk-nocsd built without `-Bsymbolic-functions` (its upstream
+  `make`; Ubuntu's build flags add it, so Ubuntu's package did not show it).
+  gtk-nocsd replaces `dlsym()`, and its answer for `g_module_symbol` was this
+  library's own function, which then called itself. Since 0.9 the next
+  definition is looked up with glibc's own `dlsym`.
+
+Cases gtk-nocsd handles and this library does not:
+
+- applications that load GTK4 through a raw `dlsym()` rather than
+  `g_module_symbol()` - Gir.Core (.NET) - get no global menu;
+- a statically linked GTK4 is not found, and the library does nothing.
+
+GTK2 and GTK3 applications are outside this library's scope;
+`appmenu-gtk-module` exports their menus.
 
 ## Which menu
 

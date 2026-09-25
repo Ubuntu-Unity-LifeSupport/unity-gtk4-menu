@@ -1,3 +1,17 @@
+unity-gtk4-menu (0.9) resolute; urgency=medium
+
+  * Look up the next g_module_symbol and gtk_widget_action_set_enabled with
+    glibc's own dlsym (dlsym@GLIBC_2.34 through dlvsym), not the dlsym we
+    link against. gtk-nocsd replaces dlsym, and built without
+    -Bsymbolic-functions - its upstream make - it answered g_module_symbol
+    with our own function: most GTK4 applications we hooked recursed until
+    SIGSEGV, in either LD_PRELOAD order. Ubuntu's gtk-nocsd build hid it.
+    Reported by gtk-nocsd's maintainer (unity-distro issue #1).
+  * README: what happens next to gtk-nocsd in each order, and the cases
+    gtk-nocsd covers that we do not (raw dlsym, static GTK4).
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Fri, 25 Sep 2026 03:43:55 +0000
+
 unity-gtk4-menu (0.8) resolute; urgency=medium
 
   * Proxy property actions too (gtk_widget_class_install_property_action).
