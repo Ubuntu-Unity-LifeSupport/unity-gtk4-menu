@@ -26,6 +26,13 @@ A header bar menu has no name of its own. With this on, the entry is named
 after the application, which repeats the name the panel shows beside it; with
 it off, a neutral label is used. Default is on.
 
+The snippet, `/usr/lib/environment.d/60-unity-gtk4-menu.conf`, preloads the
+library by path, `/usr/$LIB/libunity-gtk4-menu.so.0`; the dynamic loader
+expands `$LIB` to the multiarch directory (`lib/x86_64-linux-gnu` on amd64).
+In environment.d syntax the `$` is written `$$`. Programs that run with
+elevated privileges skip such an entry silently, so the library is installed
+with mode 0644.
+
 To disable the library entirely, shadow its environment snippet with an empty
 file of the same name:
 

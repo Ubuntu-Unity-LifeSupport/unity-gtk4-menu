@@ -1,3 +1,13 @@
+unity-gtk4-menu (0.10) resolute; urgency=medium
+
+  * Preload the library by path, /usr/$LIB/libunity-gtk4-menu.so.0, in
+    environment.d. The library no longer carries the setuid bit (mode
+    0644); the matching lintian overrides are removed.
+  * README: the path form and the file mode.
+  * Log out and back in after the upgrade.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Mon, 12 Oct 2026 23:20:29 +0000
+
 unity-gtk4-menu (0.9) resolute; urgency=medium
 
   * Look up the next g_module_symbol and gtk_widget_action_set_enabled with
