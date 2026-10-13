@@ -1,3 +1,15 @@
+unity-gtk4-menu (0.12) resolute; urgency=medium
+
+  * Give a menu that appears after realize to the global menu: an empty
+    menubar is set at the first realize and filled in place when a menu
+    button or popover menu bar is mapped later, with no timer (Pinta 3.1
+    in its default header-bar layout).
+  * The menubar is kept per application; once an application sets its own
+    menubar, ours is released and never set again.
+  * README: the libgtk-4 fallback of gtk_widget_action_set_enabled() too.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Tue, 13 Oct 2026 11:25:11 +0000
+
 unity-gtk4-menu (0.11) resolute; urgency=medium
 
   * Pass g_module_symbol() lookups on to libgmodule's own definition when
