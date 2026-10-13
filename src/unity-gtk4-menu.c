@@ -172,8 +172,27 @@ DECL(GVariant *, g_variant_new_string, (const gchar *));
 DECL(void, g_menu_item_set_attribute_value,
      (GMenuItem *, const gchar *, GVariant *));
 
+/* menus that appear after realize (0.11) */
+DECL(gpointer, g_object_ref, (gpointer));
+DECL(void, g_object_set_data_full,
+     (GObject *, const gchar *, gpointer, GDestroyNotify));
+DECL(void, g_object_weak_ref, (GObject *, GWeakNotify, gpointer));
+DECL(void, g_object_weak_unref, (GObject *, GWeakNotify, gpointer));
+DECL(void, g_signal_handler_disconnect, (gpointer, gulong));
+DECL(guint, g_idle_add, (GSourceFunc, gpointer));
+DECL(gboolean, g_source_remove, (guint));
+DECL(GType, g_type_from_name, (const gchar *));
+DECL(GType *, g_type_children, (GType, guint *));
+DECL(gpointer, g_type_class_peek, (GType));
+DECL(gboolean, g_application_get_is_registered, (GApplication *));
+DECL(gboolean, g_application_get_is_remote, (GApplication *));
+DECL(GtkRoot *, gtk_widget_get_root, (GtkWidget *));
+DECL(GType, gtk_header_bar_get_type, (void));
+DECL(GType, gtk_popover_get_type, (void));
+
 static GType type_window, type_app_window, type_menu_button;
 static GType type_popover_menu, type_popover_menu_bar;
+static GType type_header_bar, type_popover;
 
 #define RESOLVE(handle, name)                                                  \
 	do {                                                                   \
@@ -276,11 +295,29 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(glib, g_strconcat);
 	RESOLVE(glib, g_free);
 
+	RESOLVE(gobj, g_object_ref);
+	RESOLVE(gobj, g_object_set_data_full);
+	RESOLVE(gobj, g_object_weak_ref);
+	RESOLVE(gobj, g_object_weak_unref);
+	RESOLVE(gobj, g_signal_handler_disconnect);
+	RESOLVE(glib, g_idle_add);
+	RESOLVE(glib, g_source_remove);
+	RESOLVE(gobj, g_type_from_name);
+	RESOLVE(gobj, g_type_children);
+	RESOLVE(gobj, g_type_class_peek);
+	RESOLVE(gio, g_application_get_is_registered);
+	RESOLVE(gio, g_application_get_is_remote);
+	RESOLVE(gtk, gtk_widget_get_root);
+	RESOLVE(gtk, gtk_header_bar_get_type);
+	RESOLVE(gtk, gtk_popover_get_type);
+
 	type_window = p_gtk_window_get_type();
 	type_app_window = p_gtk_application_window_get_type();
 	type_menu_button = p_gtk_menu_button_get_type();
 	type_popover_menu = p_gtk_popover_menu_get_type();
 	type_popover_menu_bar = p_gtk_popover_menu_bar_get_type();
+	type_header_bar = p_gtk_header_bar_get_type();
+	type_popover = p_gtk_popover_get_type();
 
 	return 1;
 }
@@ -358,7 +395,105 @@ static void add_candidate(struct candidates *out, GtkWidget *owner,
 	     out->n, depth, c->shown, c->primary, c->score);
 }
 
-static void collect_menus(GtkWidget *widget, int depth, struct candidates *out)
+/*
+ * How a look at a window is done. At realize (late == 0) every menu button
+ * and popover menu bar of the window is a candidate, as in 0.10. A late look
+ * (late == 1) is made when a menu button or popover menu bar is mapped in an
+ * application window still waiting for a menu, after realize found none
+ * (see "menus that appear after realize" below). It is narrower, because by
+ * then a dialog presented inside the window (libadwaita's AdwDialog), a list
+ * row's own menu button or a popover can have the window as root:
+ *  - the owner is in the window's titlebar, or has a GtkHeaderBar or
+ *    AdwHeaderBar ancestor;
+ *  - it has no AdwDialog, AdwBottomSheet or GtkPopover ancestor;
+ *  - it is shown, and its menu reaches at least one app. or win. action.
+ * In every look a candidate whose model is or contains our own menubar is
+ * skipped, and so is the window's own in-window menubar (a popover menu bar
+ * whose parent is the window), which GTK builds from our menubar when the
+ * shell does not show menubars.
+ */
+struct look {
+	GtkWindow *window;
+	int late;
+	int in_titlebar;
+	GMenuModel *ours[2]; /* the container and the inner menu, or NULL */
+};
+
+/* Adw types exist only once libadwaita has registered them, which in GI and
+   .NET applications happens after GTK is hooked; so they are looked up at
+   each late look, and only a found type is kept. */
+static GType adw_type(GType *cache, const char *name)
+{
+	if (*cache == 0)
+		*cache = p_g_type_from_name(name);
+	return *cache;
+}
+
+static GType type_adw_header_bar, type_adw_dialog, type_adw_bottom_sheet;
+
+static int late_owner_ok(GtkWidget *owner, const struct look *lk)
+{
+	GType hb = adw_type(&type_adw_header_bar, "AdwHeaderBar");
+	GType dlg = adw_type(&type_adw_dialog, "AdwDialog");
+	GType sheet = adw_type(&type_adw_bottom_sheet, "AdwBottomSheet");
+	int in_header = lk->in_titlebar;
+
+	for (GtkWidget *w = p_gtk_widget_get_parent(owner);
+	     w != NULL && w != (GtkWidget *)lk->window;
+	     w = p_gtk_widget_get_parent(w)) {
+		if ((dlg != 0 && is_a(w, dlg)) || (sheet != 0 && is_a(w, sheet)) ||
+		    is_a(w, type_popover))
+			return 0;
+		if (is_a(w, type_header_bar) || (hb != 0 && is_a(w, hb)))
+			in_header = 1;
+	}
+	return in_header;
+}
+
+/* @model is one of ours, or holds one of ours within two levels of links. */
+static int contains_ours(GMenuModel *model, const struct look *lk, int depth)
+{
+	if (model == NULL)
+		return 0;
+	if (model == lk->ours[0] || model == lk->ours[1])
+		return 1;
+	if (depth >= 2)
+		return 0;
+
+	gint n = p_g_menu_model_get_n_items(model);
+	for (gint i = 0; i < n; i++) {
+		const char *links[] = { "section", "submenu" };
+		for (int l = 0; l < 2; l++) {
+			GMenuModel *child =
+				p_g_menu_model_get_item_link(model, i, links[l]);
+			if (child == NULL)
+				continue;
+			int found = contains_ours(child, lk, depth + 1);
+			p_g_object_unref(child);
+			if (found)
+				return 1;
+		}
+	}
+	return 0;
+}
+
+static void watch_late(GtkWidget *widget, const char *property,
+		       GtkWindow *window);
+
+static void consider(struct candidates *out, GtkWidget *owner,
+		     GMenuModel *model, int primary, int depth,
+		     const struct look *lk)
+{
+	if (contains_ours(model, lk, 0))
+		return;
+	if (lk->late && (!late_owner_ok(owner, lk) || !is_shown(owner) ||
+			 reachable_items(model, 0) == 0))
+		return;
+	add_candidate(out, owner, model, primary, depth);
+}
+
+static void collect_menus(GtkWidget *widget, int depth, struct candidates *out,
+			  const struct look *lk)
 {
 	if (widget == NULL || depth > 32)
 		return;
@@ -366,6 +501,7 @@ static void collect_menus(GtkWidget *widget, int depth, struct candidates *out)
 	if (is_a(widget, type_menu_button)) {
 		GtkMenuButton *button = (GtkMenuButton *)widget;
 		GMenuModel *model = p_gtk_menu_button_get_menu_model(button);
+		GtkPopover *popover = NULL;
 
 		/* An application may call gtk_menu_button_set_popover() rather
 		   than set_menu_model(), leaving get_menu_model() NULL though a
@@ -373,7 +509,7 @@ static void collect_menus(GtkWidget *widget, int depth, struct candidates *out)
 		   Where the popover is a GtkPopoverMenu the model is still
 		   reachable. */
 		if (model == NULL) {
-			GtkPopover *popover = p_gtk_menu_button_get_popover(button);
+			popover = p_gtk_menu_button_get_popover(button);
 			if (is_a(popover, type_popover_menu))
 				model = p_gtk_popover_menu_get_menu_model(
 					(GtkPopoverMenu *)popover);
@@ -382,20 +518,31 @@ static void collect_menus(GtkWidget *widget, int depth, struct candidates *out)
 		if (model != NULL) {
 			int primary = p_gtk_menu_button_get_primary != NULL &&
 				      p_gtk_menu_button_get_primary(button);
-			add_candidate(out, widget, model, primary, depth);
+			consider(out, widget, model, primary, depth, lk);
+		} else if (lk->late) {
+			/* Mapped without a menu yet: look again when it gets
+			   one. */
+			watch_late(widget, "notify::menu-model", lk->window);
+			watch_late(widget, "notify::popover", lk->window);
+			if (is_a(popover, type_popover_menu))
+				watch_late((GtkWidget *)popover,
+					   "notify::menu-model", lk->window);
 		}
 	}
 
-	if (is_a(widget, type_popover_menu_bar)) {
+	if (is_a(widget, type_popover_menu_bar) &&
+	    p_gtk_widget_get_parent(widget) != (GtkWidget *)lk->window) {
 		GMenuModel *model = p_gtk_popover_menu_bar_get_menu_model(
 			(GtkPopoverMenuBar *)widget);
 		if (model != NULL)
-			add_candidate(out, widget, model, 0, depth);
+			consider(out, widget, model, 0, depth, lk);
+		else if (lk->late)
+			watch_late(widget, "notify::menu-model", lk->window);
 	}
 
 	for (GtkWidget *child = p_gtk_widget_get_first_child(widget);
 	     child != NULL; child = p_gtk_widget_get_next_sibling(child))
-		collect_menus(child, depth + 1, out);
+		collect_menus(child, depth + 1, out, lk);
 }
 
 /* Items anywhere in @model whose action is app.* or win.* */
@@ -432,14 +579,18 @@ static int reachable_items(GMenuModel *model, int depth)
 /* On success *owner is the widget the menu hangs off. Its actions resolve the
    way the application's own popover resolves them, which is what activating
    a widget-scoped action needs. */
-static GMenuModel *find_menu_model(GtkWindow *window, GtkWidget **owner)
+static GMenuModel *find_menu_model(GtkWindow *window, GtkWidget **owner,
+				   struct look *lk)
 {
 	struct candidates found = { .n = 0 };
 
 	/* The title bar is not part of the ordinary child tree, and yelp keeps
 	   its header bar in the content rather than the title bar. Try both. */
-	collect_menus(p_gtk_window_get_titlebar(window), 0, &found);
-	collect_menus(p_gtk_window_get_child(window), 0, &found);
+	lk->window = window;
+	lk->in_titlebar = 1;
+	collect_menus(p_gtk_window_get_titlebar(window), 0, &found, lk);
+	lk->in_titlebar = 0;
+	collect_menus(p_gtk_window_get_child(window), 0, &found, lk);
 
 	if (found.n == 0)
 		return NULL;
@@ -894,28 +1045,179 @@ static GMenuModel *clean_model(GMenuModel *model, int depth,
 
 /* ---- attaching ----------------------------------------------------------- */
 
-/* The menubar we set, to tell it from one the application set itself. */
-static GMenuModel *our_menubar;
+/*
+ * The menubar we set is a record kept on the GtkApplication, in one of three
+ * states (no record means nothing was set yet):
+ *  OURS_EMPTY  our menubar is set and has no item yet: no window had a menu
+ *              at realize. GTK writes _GTK_MENUBAR_OBJECT_PATH only at
+ *              realize and only when a menubar is set then, so the menubar
+ *              must exist before a menu does.
+ *  OURS_FILLED it holds one item, the holder labelled with the application's
+ *              name, whose submenu is the cleaned copy of the menu found.
+ *  TAKEN       the application set a menubar of its own, at realize or later.
+ *              Final: we never set ours again.
+ * container is the menubar and inner the holder's submenu. Both are edited in
+ * place, never replaced, so a panel that subscribed to the empty menubar sees
+ * the holder appear.
+ */
+enum { OURS_EMPTY = 1, OURS_FILLED, TAKEN };
 
-static void attach_menubar(GtkWindow *window)
+struct record {
+	GtkApplication *app; /* the record lives as long as the application */
+	int state;
+	GMenu *container;
+	GMenu *inner;
+};
+
+#define RECORD_KEY "unity-gtk4-menu-record"
+
+static void release_menus(struct record *rec)
 {
-	GtkApplication *app = p_gtk_window_get_application(window);
+	if (rec->container != NULL)
+		p_g_object_unref(rec->container);
+	if (rec->inner != NULL)
+		p_g_object_unref(rec->inner);
+	rec->container = NULL;
+	rec->inner = NULL;
+}
 
-	if (app == NULL)
-		return;
+static void record_free(gpointer data)
+{
+	struct record *rec = data;
 
-	GMenuModel *existing = p_gtk_application_get_menubar(app);
-	if (existing != NULL && existing != our_menubar) {
-		note("the application already has a menubar");
-		return;
+	release_menus(rec);
+	free(rec);
+}
+
+static struct record *record_for(GtkApplication *app)
+{
+	return p_g_object_get_data((GObject *)app, RECORD_KEY);
+}
+
+static struct record *record_new(GtkApplication *app)
+{
+	struct record *rec = calloc(1, sizeof *rec);
+
+	if (rec == NULL)
+		return NULL;
+	rec->app = app;
+	p_g_object_set_data_full((GObject *)app, RECORD_KEY, rec, record_free);
+	return rec;
+}
+
+/* ---- windows that wait for a menu ------------------------------------------ */
+
+/*
+ * An application window whose realize found no menu waits, as long as its
+ * application's menubar is still empty. A late look is made at it when a menu
+ * button or popover menu bar is mapped in it (the map shims below), or when a
+ * button it holds gets a menu later. A window stops waiting when the menubar
+ * is filled (from it or from another window), when it is unrealized or
+ * destroyed, or when the application takes over the menubar. There is no
+ * timer.
+ *
+ * gtk_window_dispose() releases the application before the window is
+ * unrealized and destroyed, so each entry holds a reference on the
+ * application, and on the record through it, for as long as it waits.
+ */
+struct waiter {
+	struct waiter *next;
+	GtkWindow *window; /* weak */
+	GtkApplication *app; /* strong */
+	struct record *rec;
+	guint idle;
+	gulong on_unrealize, on_destroy;
+};
+
+static struct waiter *waiters;
+static int waiting_count; /* in the whole process, for the map shims */
+
+static struct waiter *waiter_find(GtkWindow *window)
+{
+	for (struct waiter *w = waiters; w != NULL; w = w->next)
+		if (w->window == window && window != NULL)
+			return w;
+	return NULL;
+}
+
+static void waiter_remove(struct waiter *w)
+{
+	for (struct waiter **p = &waiters; *p != NULL; p = &(*p)->next) {
+		if (*p == w) {
+			*p = w->next;
+			break;
+		}
+	}
+	waiting_count--;
+
+	if (w->idle != 0)
+		p_g_source_remove(w->idle);
+	if (w->window != NULL) {
+		p_g_signal_handler_disconnect(w->window, w->on_unrealize);
+		p_g_signal_handler_disconnect(w->window, w->on_destroy);
+		p_g_object_remove_weak_pointer((GObject *)w->window,
+					       (gpointer *)&w->window);
 	}
 
+	GtkApplication *app = w->app;
+	free(w);
+	note("a window stopped waiting (%d waiting)", waiting_count);
+	p_g_object_unref(app); /* last: it may free the record */
+}
+
+/* The caller holds a reference on the application. */
+static void waiters_drop_record(struct record *rec)
+{
+	struct waiter *w;
+
+	do {
+		for (w = waiters; w != NULL && w->rec != rec; w = w->next)
+			;
+		if (w != NULL)
+			waiter_remove(w);
+	} while (w != NULL);
+}
+
+static void on_window_gone(GtkWidget *window, gpointer data)
+{
+	waiter_remove(data);
+}
+
+static void go_taken(struct record *rec)
+{
+	note("the application set a menubar of its own; ours is released");
+	rec->state = TAKEN;
+	waiters_drop_record(rec);
+	release_menus(rec);
+}
+
+static void on_menubar_notify(GObject *app, GParamSpec *pspec, gpointer data)
+{
+	struct record *rec = data;
+
+	if ((rec->state == OURS_EMPTY || rec->state == OURS_FILLED) &&
+	    p_gtk_application_get_menubar((GtkApplication *)app) !=
+		    (GMenuModel *)rec->container)
+		go_taken(rec);
+}
+
+/* ---- looking for a menu and filling the menubar ---------------------------- */
+
+/* Returns 1 if @window's menu filled the menubar. The caller holds a
+   reference on the application. */
+static int look(GtkWindow *window, struct record *rec, int late)
+{
+	GtkApplication *app = rec->app;
+	struct look lk = {
+		.late = late,
+		.ours = { (GMenuModel *)rec->container, (GMenuModel *)rec->inner },
+	};
 	GtkWidget *owner = NULL;
-	GMenuModel *model = find_menu_model(window, &owner);
+	GMenuModel *model = find_menu_model(window, &owner, &lk);
 
 	if (model == NULL) {
-		note("no menu model in this window");
-		return;
+		note(late ? "late look: no menu yet" : "no menu model in this window");
+		return 0;
 	}
 
 	struct scope scope = {
@@ -925,27 +1227,283 @@ static void attach_menubar(GtkWindow *window)
 	};
 	GMenuModel *cleaned = clean_model(model, 0, &scope);
 
-	/* The menubar is per application, but "win." resolves against the
-	   focused window. A second window of the same application needs the
-	   same stand-ins in its own map; the copy made for it is thrown away. */
-	if (existing != NULL) {
-		note("menubar already ours, stand-ins added for this window");
-		p_g_object_unref(cleaned);
-		return;
-	}
-
 	if (scope.dropped > 0)
 		note("dropped %d item(s) that cannot cross D-Bus", scope.dropped);
 
-	gchar *label = menu_label(app);
-	GMenu *menubar = p_g_menu_new();
-	p_g_menu_append_submenu(menubar, label, cleaned);
+	gint n = p_g_menu_model_get_n_items(cleaned);
+	if (n == 0) {
+		note("the menu found has no item that can cross D-Bus; not used");
+		p_g_object_unref(cleaned);
+		return 0;
+	}
+
+	/* Nothing scheduled by the fill itself may start another look. */
+	waiters_drop_record(rec);
+
+	for (gint i = 0; i < n; i++) {
+		GMenuItem *item = p_g_menu_item_new_from_model(cleaned, i);
+		p_g_menu_append_item(rec->inner, item);
+		p_g_object_unref(item);
+	}
 	p_g_object_unref(cleaned);
-	p_gtk_application_set_menubar(app, (GMenuModel *)menubar);
-	our_menubar = (GMenuModel *)menubar;
-	p_g_object_unref(menubar);
-	note("menubar attached, labelled \"%s\"", label);
+
+	gchar *label = menu_label(app);
+	p_g_menu_append_submenu(rec->container, label, (GMenuModel *)rec->inner);
+	rec->state = OURS_FILLED;
+	note("menubar filled%s, labelled \"%s\"", late ? " late" : "", label);
 	p_g_free(label);
+	return 1;
+}
+
+static gboolean look_idle(gpointer data)
+{
+	struct waiter *w = data;
+
+	w->idle = 0;
+	if (w->window == NULL) {
+		waiter_remove(w);
+		return FALSE;
+	}
+
+	GtkApplication *app = p_g_object_ref(w->app);
+	struct record *rec = w->rec;
+
+	note("late look");
+	if (rec->state == OURS_EMPTY) {
+		if (p_gtk_application_get_menubar(app) != (GMenuModel *)rec->container)
+			go_taken(rec);
+		else
+			look(w->window, rec, 1); /* may free w */
+	}
+	p_g_object_unref(app);
+	return FALSE;
+}
+
+static void schedule_look(struct waiter *w)
+{
+	if (w->idle == 0)
+		w->idle = p_g_idle_add(look_idle, w);
+}
+
+static void on_late_notify(GObject *object, GParamSpec *pspec, gpointer window)
+{
+	struct waiter *w = waiter_find(window);
+
+	if (w != NULL)
+		schedule_look(w);
+}
+
+/* A widget of a waiting window that has no menu yet: look again when its
+   @property changes. Connected once per widget and property, for the
+   window's life. */
+static void watch_late(GtkWidget *widget, const char *property,
+		       GtkWindow *window)
+{
+	gchar *key = p_g_strconcat("unity-gtk4-menu-watch:", property, NULL);
+
+	if (p_g_object_get_data((GObject *)widget, key) == NULL) {
+		p_g_object_set_data((GObject *)widget, key, (gpointer)1);
+		p_g_signal_connect_object(widget, property,
+					  G_CALLBACK(on_late_notify), window, 0);
+	}
+	p_g_free(key);
+}
+
+/* ---- the map shims ----------------------------------------------------------- */
+
+/*
+ * The class map of GtkMenuButton and GtkPopoverMenuBar is replaced, as the
+ * realize of the windows is, once the first window waits; while no window
+ * waits the shim costs one integer test. Pinta packs its menu buttons into a
+ * header bar that is already mapped, which maps them on the spot with their
+ * menu set. The class reference is taken then, not at load (GTK is up by then)
+ * and never dropped. Subclasses whose class was initialised before and kept
+ * the original map get the shim too; a subclass with its own map is not
+ * covered.
+ */
+static void (*real_menu_button_map)(GtkWidget *);
+static void (*real_menu_bar_map)(GtkWidget *);
+
+static void late_mapped(GtkWidget *widget)
+{
+	if (waiting_count == 0)
+		return;
+
+	GtkRoot *root = p_gtk_widget_get_root(widget);
+	if (root == NULL || p_gtk_widget_get_parent(widget) == (GtkWidget *)root)
+		return; /* the window's own in-window menubar */
+
+	struct waiter *w = waiter_find((GtkWindow *)root);
+	if (w != NULL)
+		schedule_look(w);
+}
+
+static void shim_menu_button_map(GtkWidget *widget)
+{
+	if (real_menu_button_map != NULL)
+		real_menu_button_map(widget);
+	late_mapped(widget);
+}
+
+static void shim_menu_bar_map(GtkWidget *widget)
+{
+	if (real_menu_bar_map != NULL)
+		real_menu_bar_map(widget);
+	late_mapped(widget);
+}
+
+static void patch_children(GType type, void (*orig)(GtkWidget *),
+			   void (*shim)(GtkWidget *))
+{
+	guint n = 0;
+	GType *children = p_g_type_children(type, &n);
+
+	for (guint i = 0; i < n; i++) {
+		GtkWidgetClass *klass = p_g_type_class_peek(children[i]);
+		if (klass != NULL && klass->map == orig)
+			klass->map = shim;
+		patch_children(children[i], orig, shim);
+	}
+	p_g_free(children);
+}
+
+static void patch_map(GType type, void (**real)(GtkWidget *),
+		      void (*shim)(GtkWidget *), const char *name)
+{
+	GtkWidgetClass *klass = (GtkWidgetClass *)p_g_type_class_ref(type);
+
+	if (klass == NULL || klass->map == shim)
+		return;
+	*real = klass->map;
+	klass->map = shim;
+	patch_children(type, *real, shim);
+	note("hooked %s::map", name);
+}
+
+static void install_map_shims(void)
+{
+	patch_map(type_menu_button, &real_menu_button_map, shim_menu_button_map,
+		  "GtkMenuButton");
+	patch_map(type_popover_menu_bar, &real_menu_bar_map, shim_menu_bar_map,
+		  "GtkPopoverMenuBar");
+}
+
+static void waiter_add(struct record *rec, GtkWindow *window)
+{
+	if (waiter_find(window) != NULL)
+		return;
+
+	struct waiter *w = calloc(1, sizeof *w);
+	if (w == NULL)
+		return;
+
+	w->window = window;
+	p_g_object_add_weak_pointer((GObject *)window, (gpointer *)&w->window);
+	w->app = p_g_object_ref(rec->app);
+	w->rec = rec;
+	w->on_unrealize = p_g_signal_connect_data(window, "unrealize",
+						  G_CALLBACK(on_window_gone), w,
+						  NULL, 0);
+	w->on_destroy = p_g_signal_connect_data(window, "destroy",
+						G_CALLBACK(on_window_gone), w,
+						NULL, 0);
+	w->next = waiters;
+	waiters = w;
+	waiting_count++;
+	install_map_shims();
+	note("the window waits for a menu (%d waiting)", waiting_count);
+}
+
+/* ---- attaching at realize ---------------------------------------------------- */
+
+static void attach_menubar(GtkWindow *window)
+{
+	GtkApplication *app = p_gtk_window_get_application(window);
+
+	if (app == NULL)
+		return;
+
+	struct record *rec = record_for(app);
+
+	if (rec == NULL) {
+		if (p_gtk_application_get_menubar(app) != NULL) {
+			rec = record_new(app);
+			if (rec != NULL)
+				rec->state = TAKEN;
+			note("the application already has a menubar");
+			return;
+		}
+		/* gtk_application_set_menubar() requires both; checked first, and
+		   in this order, so a failed check cannot raise a critical. */
+		if (!p_g_application_get_is_registered((GApplication *)app)) {
+			note("the application is not registered; nothing set");
+			return;
+		}
+		if (p_g_application_get_is_remote((GApplication *)app)) {
+			note("the application is remote; nothing set");
+			return;
+		}
+
+		rec = record_new(app);
+		if (rec == NULL)
+			return;
+		rec->container = p_g_menu_new();
+		rec->inner = p_g_menu_new();
+		p_gtk_application_set_menubar(app, (GMenuModel *)rec->container);
+		if (p_gtk_application_get_menubar(app) !=
+		    (GMenuModel *)rec->container) {
+			rec->state = TAKEN;
+			release_menus(rec);
+			note("our menubar was not taken; nothing set");
+			return;
+		}
+		rec->state = OURS_EMPTY;
+		p_g_signal_connect_data(app, "notify::menubar",
+					G_CALLBACK(on_menubar_notify), rec, NULL, 0);
+		note("empty menubar set");
+	} else if (rec->state != TAKEN &&
+		   p_gtk_application_get_menubar(app) !=
+			   (GMenuModel *)rec->container) {
+		go_taken(rec);
+	}
+
+	switch (rec->state) {
+	case TAKEN:
+		note("the application has a menubar of its own");
+		return;
+
+	case OURS_FILLED: {
+		/* The menubar is per application, but "win." resolves against
+		   the focused window. A second window of the same application
+		   needs the same stand-ins in its own map; the copy made for it
+		   is thrown away. */
+		struct look lk = {
+			.late = 0,
+			.ours = { (GMenuModel *)rec->container,
+				  (GMenuModel *)rec->inner },
+		};
+		GtkWidget *owner = NULL;
+		GMenuModel *model = find_menu_model(window, &owner, &lk);
+		if (model != NULL) {
+			struct scope scope = {
+				.owner = owner,
+				.map = is_a(window, type_app_window)
+					       ? (GActionMap *)window
+					       : NULL,
+			};
+			p_g_object_unref(clean_model(model, 0, &scope));
+			note("menubar already ours, stand-ins added for this window");
+		}
+		return;
+	}
+
+	case OURS_EMPTY:
+		if (look(window, rec, 0))
+			return;
+		if (is_a(window, type_app_window))
+			waiter_add(rec, window);
+		return;
+	}
 }
 
 /* ---- the hook ------------------------------------------------------------ */
