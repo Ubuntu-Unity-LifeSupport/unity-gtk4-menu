@@ -56,6 +56,9 @@ when that search finds none, to libgmodule's own. Python opens its extension
 modules without `RTLD_GLOBAL`, so in a PyGObject process libgmodule is not in
 the global scope; up to 0.10 the lookup then failed, and without gtk-nocsd
 preloaded (its opt-out) every PyGObject program stopped at its first import.
+The library's `gtk_widget_action_set_enabled()` finds the real setter the same
+way, falling back to libgtk-4's own; up to 0.10 a GTK4 plugin opened
+`RTLD_LOCAL` by a program without GTK lost every class-action disable.
 
 ## Next to gtk-nocsd
 
