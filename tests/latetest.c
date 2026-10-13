@@ -13,7 +13,7 @@
  * library preloaded. Run on a test machine, for example:
  *
  *   cc -o latetest tests/latetest.c $(pkg-config --cflags --libs gtk4 x11)
- *   for c in 1 2 3 4 5 7 8 9 10 11 12; do
+ *   for c in 1 2 3 4 5 7 8 9 11 12; do
  *     dbus-run-session -- xvfb-run -a env G_DEBUG=fatal-criticals \
  *       UNITY_GTK4_MENU_FORCE=1 UNITY_GTK4_MENU_DEBUG=1 \
  *       UNITY_GTK4_MENU_LOG=/tmp/latetest-$c.log \
@@ -33,7 +33,9 @@
  *      with a menu at realize (gnome-contacts' order)
  *   8  a menu present at realize (the 0.10 path)
  *   9  a GtkMenuButton subclass whose class was initialised before
- *  10  an application window realized before its application is registered
+ *  (10 is not a case: GTK refuses an application window before the
+ *      application's startup, so the library's "not registered" check is
+ *      defensive only.)
  *  11  a late menu with nothing that can cross D-Bus, then a valid one
  *  12  a waiting window destroyed after the last application reference
  *      outside it was dropped
@@ -405,20 +407,6 @@ int main(int argc, char **argv)
 {
 	which = argc > 1 ? atoi(argv[1]) : 1;
 	control = g_getenv("LATETEST_CONTROL") != NULL;
-
-	if (which == 10) {
-		/* realized before the application is registered */
-		gtk_init();
-		app = gtk_application_new("org.unitydistro.LateTest10",
-					  G_APPLICATION_NON_UNIQUE);
-		GtkWidget *w = gtk_application_window_new(app);
-		gtk_widget_realize(w);
-		CHECK_LOG(1, "the application is not registered");
-		gtk_window_destroy(GTK_WINDOW(w));
-		g_object_unref(app);
-		printf("%s case %d\n", failed ? "FAIL" : "PASS", which);
-		return failed;
-	}
 
 	char *id = g_strdup_printf("org.unitydistro.LateTest%d", which);
 	app = gtk_application_new(id, G_APPLICATION_NON_UNIQUE);
