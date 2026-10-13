@@ -189,6 +189,17 @@ DECL(gboolean, g_application_get_is_remote, (GApplication *));
 DECL(GtkRoot *, gtk_widget_get_root, (GtkWidget *));
 DECL(GType, gtk_header_bar_get_type, (void));
 DECL(GType, gtk_popover_get_type, (void));
+DECL(void, g_menu_remove, (GMenu *, gint));
+DECL(void, g_menu_insert_item, (GMenu *, gint, GMenuItem *));
+DECL(GMenuAttributeIter *, g_menu_model_iterate_item_attributes,
+     (GMenuModel *, gint));
+DECL(gboolean, g_menu_attribute_iter_get_next,
+     (GMenuAttributeIter *, const gchar **, GVariant **));
+DECL(GMenuLinkIter *, g_menu_model_iterate_item_links, (GMenuModel *, gint));
+DECL(gboolean, g_menu_link_iter_get_next,
+     (GMenuLinkIter *, const gchar **, GMenuModel **));
+DECL(gboolean, g_variant_equal, (gconstpointer, gconstpointer));
+DECL(GList *, gtk_application_get_windows, (GtkApplication *));
 
 static GType type_window, type_app_window, type_menu_button;
 static GType type_popover_menu, type_popover_menu_bar;
@@ -310,6 +321,14 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(gtk, gtk_widget_get_root);
 	RESOLVE(gtk, gtk_header_bar_get_type);
 	RESOLVE(gtk, gtk_popover_get_type);
+	RESOLVE(gio, g_menu_remove);
+	RESOLVE(gio, g_menu_insert_item);
+	RESOLVE(gio, g_menu_model_iterate_item_attributes);
+	RESOLVE(gio, g_menu_attribute_iter_get_next);
+	RESOLVE(gio, g_menu_model_iterate_item_links);
+	RESOLVE(gio, g_menu_link_iter_get_next);
+	RESOLVE(glib, g_variant_equal);
+	RESOLVE(gtk, gtk_application_get_windows);
 
 	type_window = p_gtk_window_get_type();
 	type_app_window = p_gtk_application_window_get_type();
@@ -987,9 +1006,16 @@ static void proxy_item(GMenuModel *model, gint i, GMenuItem *item,
  *
  * Build a copy of the model with those items removed, and with any section or
  * submenu left empty by the removal dropped too, so no blank rows or empty
- * separators remain. The copy is static: it does not follow later changes to
- * the original, which is acceptable for header bar menus, which are built once.
+ * separators remain. Every GMenu of the copy carries COPY_KEY, so later edits
+ * (sync_menu) can tell our menus from the application's.
  */
+#define COPY_KEY "unity-gtk4-menu-copy"
+
+static int is_copy(GMenuModel *model)
+{
+	return model != NULL && p_g_object_get_data((GObject *)model, COPY_KEY);
+}
+
 static int has_attribute(GMenuModel *model, gint i, const char *name)
 {
 	GVariant *v = p_g_menu_model_get_item_attribute_value(model, i, name, NULL);
@@ -1004,6 +1030,8 @@ static GMenuModel *clean_model(GMenuModel *model, int depth,
 {
 	GMenu *out = p_g_menu_new();
 	gint n = p_g_menu_model_get_n_items(model);
+
+	p_g_object_set_data((GObject *)out, COPY_KEY, GINT_TO_POINTER(1));
 
 	for (gint i = 0; i < n; i++) {
 		if (has_attribute(model, i, "custom")) {
@@ -1062,14 +1090,410 @@ static GMenuModel *clean_model(GMenuModel *model, int depth,
  */
 enum { OURS_EMPTY = 1, OURS_FILLED, TAKEN };
 
+struct watch {
+	GMenuModel *model;
+	gulong handler;
+};
+
 struct record {
 	GtkApplication *app; /* the record lives as long as the application */
 	int state;
 	GMenu *container;
 	GMenu *inner;
+	/* following the menu copied into inner, from the fill on */
+	GMenuModel *source;
+	GtkWidget *owner;   /* weak */
+	GtkWindow *window;  /* weak */
+	struct watch *watches;
+	int n_watches, max_watches;
+	char **names;       /* the source's action names at the last copy */
+	int n_names;
+	guint rebuild_idle;
+	int syncing;
+	unsigned rebuilds;
 };
 
 #define RECORD_KEY "unity-gtk4-menu-record"
+
+/* ---- following changes of the menu copied --------------------------------- */
+
+/*
+ * After a fill the record keeps the source model and watches items-changed on
+ * it and on every section and submenu reachable from it. A burst of changes
+ * schedules one idle, which copies the source again and syncs the copy into
+ * inner in place (sync_menu), so the exporter sends Changed only for what
+ * changed and an open panel menu keeps its groups. Our own menus are never
+ * watched, and the application's are never edited.
+ */
+#define MAX_DEPTH 16
+
+static void on_source_changed(GMenuModel *model, gint position, gint removed,
+			      gint added, gpointer data);
+
+static int watched(struct record *rec, GMenuModel *model)
+{
+	for (int i = 0; i < rec->n_watches; i++)
+		if (rec->watches[i].model == model)
+			return 1;
+	return 0;
+}
+
+static void watch_model(struct record *rec, GMenuModel *model, int depth)
+{
+	if (depth >= MAX_DEPTH || model == (GMenuModel *)rec->container ||
+	    model == (GMenuModel *)rec->inner || watched(rec, model))
+		return;
+
+	if (rec->n_watches == rec->max_watches) {
+		int max = rec->max_watches ? rec->max_watches * 2 : 8;
+		struct watch *w = realloc(rec->watches, max * sizeof *w);
+		if (w == NULL)
+			return;
+		rec->watches = w;
+		rec->max_watches = max;
+	}
+	struct watch *w = &rec->watches[rec->n_watches++];
+	w->model = p_g_object_ref(model);
+	w->handler = p_g_signal_connect_data(model, "items-changed",
+					     (GCallback)on_source_changed, rec,
+					     NULL, 0);
+
+	gint n = p_g_menu_model_get_n_items(model);
+	for (gint i = 0; i < n; i++) {
+		const char *links[] = { "section", "submenu" };
+		for (int l = 0; l < 2; l++) {
+			GMenuModel *child =
+				p_g_menu_model_get_item_link(model, i, links[l]);
+			if (child == NULL)
+				continue;
+			watch_model(rec, child, depth + 1);
+			p_g_object_unref(child);
+		}
+	}
+}
+
+static void unwatch(struct record *rec)
+{
+	for (int i = 0; i < rec->n_watches; i++) {
+		p_g_signal_handler_disconnect(rec->watches[i].model,
+					      rec->watches[i].handler);
+		p_g_object_unref(rec->watches[i].model);
+	}
+	rec->n_watches = 0;
+}
+
+static int has_name(char **names, int n, const char *name)
+{
+	for (int i = 0; i < n; i++)
+		if (strcmp(names[i], name) == 0)
+			return 1;
+	return 0;
+}
+
+static void collect_names(GMenuModel *model, int depth, char ***names, int *n)
+{
+	if (depth >= MAX_DEPTH)
+		return;
+
+	gint items = p_g_menu_model_get_n_items(model);
+	for (gint i = 0; i < items; i++) {
+		GVariant *v = p_g_menu_model_get_item_attribute_value(
+			model, i, "action", G_VARIANT_TYPE_STRING);
+		if (v != NULL) {
+			const char *name = p_g_variant_get_string(v, NULL);
+			char **more = has_name(*names, *n, name)
+					      ? NULL
+					      : realloc(*names, (*n + 1) * sizeof **names);
+			if (more != NULL) {
+				*names = more;
+				(*names)[*n] = strdup(name);
+				if ((*names)[*n] != NULL)
+					(*n)++;
+			}
+			p_g_variant_unref(v);
+		}
+		const char *links[] = { "section", "submenu" };
+		for (int l = 0; l < 2; l++) {
+			GMenuModel *child =
+				p_g_menu_model_get_item_link(model, i, links[l]);
+			if (child == NULL)
+				continue;
+			collect_names(child, depth + 1, names, n);
+			p_g_object_unref(child);
+		}
+	}
+}
+
+static void free_names(char **names, int n)
+{
+	for (int i = 0; i < n; i++)
+		free(names[i]);
+	free(names);
+}
+
+static void stop_following(struct record *rec)
+{
+	if (rec->rebuild_idle != 0)
+		p_g_source_remove(rec->rebuild_idle);
+	rec->rebuild_idle = 0;
+	unwatch(rec);
+	free(rec->watches);
+	rec->watches = NULL;
+	rec->max_watches = 0;
+	if (rec->owner != NULL)
+		p_g_object_remove_weak_pointer((GObject *)rec->owner,
+					       (gpointer *)&rec->owner);
+	if (rec->window != NULL)
+		p_g_object_remove_weak_pointer((GObject *)rec->window,
+					       (gpointer *)&rec->window);
+	rec->owner = NULL;
+	rec->window = NULL;
+	if (rec->source != NULL)
+		p_g_object_unref(rec->source);
+	rec->source = NULL;
+	free_names(rec->names, rec->n_names);
+	rec->names = NULL;
+	rec->n_names = 0;
+}
+
+static void start_following(struct record *rec, GMenuModel *source,
+			    GtkWidget *owner, GtkWindow *window)
+{
+	stop_following(rec);
+	rec->source = p_g_object_ref(source);
+	rec->owner = owner;
+	rec->window = window;
+	if (owner != NULL)
+		p_g_object_add_weak_pointer((GObject *)owner,
+					    (gpointer *)&rec->owner);
+	p_g_object_add_weak_pointer((GObject *)window, (gpointer *)&rec->window);
+	collect_names(source, 0, &rec->names, &rec->n_names);
+	watch_model(rec, source, 0);
+}
+
+/* Same attributes (names and values) and the same link names. */
+static int same_item(GMenuModel *a, gint i, GMenuModel *b, gint j)
+{
+	int na = 0, same = 1;
+	const gchar *name;
+	GVariant *value;
+
+	GMenuAttributeIter *it = p_g_menu_model_iterate_item_attributes(a, i);
+	while (same && p_g_menu_attribute_iter_get_next(it, &name, &value)) {
+		GVariant *other =
+			p_g_menu_model_get_item_attribute_value(b, j, name, NULL);
+		same = other != NULL && p_g_variant_equal(value, other);
+		if (other != NULL)
+			p_g_variant_unref(other);
+		p_g_variant_unref(value);
+		na++;
+	}
+	p_g_object_unref(it);
+	if (!same)
+		return 0;
+
+	int nb = 0;
+	it = p_g_menu_model_iterate_item_attributes(b, j);
+	while (p_g_menu_attribute_iter_get_next(it, &name, &value)) {
+		p_g_variant_unref(value);
+		nb++;
+	}
+	p_g_object_unref(it);
+	if (na != nb)
+		return 0;
+
+	GMenuModel *link;
+	int la = 0, lb = 0;
+	GMenuLinkIter *li = p_g_menu_model_iterate_item_links(a, i);
+	while (same && p_g_menu_link_iter_get_next(li, &name, &link)) {
+		GMenuModel *other = p_g_menu_model_get_item_link(b, j, name);
+		same = other != NULL;
+		if (other != NULL)
+			p_g_object_unref(other);
+		p_g_object_unref(link);
+		la++;
+	}
+	p_g_object_unref(li);
+	if (!same)
+		return 0;
+	li = p_g_menu_model_iterate_item_links(b, j);
+	while (p_g_menu_link_iter_get_next(li, &name, &link)) {
+		p_g_object_unref(link);
+		lb++;
+	}
+	p_g_object_unref(li);
+	return la == lb;
+}
+
+static void replace_item(GMenu *ours, gint i, GMenuModel *new, gint j)
+{
+	GMenuItem *item = p_g_menu_item_new_from_model(new, j);
+	p_g_menu_remove(ours, i);
+	p_g_menu_insert_item(ours, i, item);
+	p_g_object_unref(item);
+}
+
+static int sync_menu(GMenu *ours, GMenuModel *new, int depth);
+
+/* An item kept at @i of ours (equal to @j of new): its links are synced into
+   our own copies, or the item is replaced where a link is the application's
+   own model and differs. */
+static int sync_links(GMenu *ours, gint i, GMenuModel *new, gint j, int depth)
+{
+	int replaced = 0, replace = 0;
+	const gchar *name;
+	GMenuModel *link;
+
+	GMenuLinkIter *li =
+		p_g_menu_model_iterate_item_links((GMenuModel *)ours, i);
+	while (!replace && p_g_menu_link_iter_get_next(li, &name, &link)) {
+		GMenuModel *other = p_g_menu_model_get_item_link(new, j, name);
+		if (other != NULL && other != link) {
+			if (is_copy(link) && is_copy(other))
+				replaced += sync_menu((GMenu *)link, other, depth + 1);
+			else
+				replace = 1;
+		}
+		if (other != NULL)
+			p_g_object_unref(other);
+		p_g_object_unref(link);
+	}
+	p_g_object_unref(li);
+
+	if (replace) {
+		replace_item(ours, i, new, j);
+		replaced++;
+	}
+	return replaced;
+}
+
+/* Edit @ours, one of our copies, into @new, another: the common prefix and
+   suffix are kept (their links synced), and only the middle is edited. */
+static int sync_menu(GMenu *ours, GMenuModel *new, int depth)
+{
+	GMenuModel *old = (GMenuModel *)ours;
+	gint n_old = p_g_menu_model_get_n_items(old);
+	gint n_new = p_g_menu_model_get_n_items(new);
+	gint min = n_old < n_new ? n_old : n_new;
+	gint pre = 0, suf = 0;
+	int replaced = 0;
+
+	if (depth >= MAX_DEPTH)
+		return 0;
+
+	while (pre < min && same_item(old, pre, new, pre))
+		pre++;
+	while (suf < min - pre &&
+	       same_item(old, n_old - 1 - suf, new, n_new - 1 - suf))
+		suf++;
+
+	/* The suffix first: edits in the middle shift its positions. */
+	for (gint k = 0; k < suf; k++)
+		replaced += sync_links(ours, n_old - 1 - k, new, n_new - 1 - k,
+				       depth);
+	for (gint k = 0; k < pre; k++)
+		replaced += sync_links(ours, k, new, k, depth);
+
+	gint mid_old = n_old - pre - suf, mid_new = n_new - pre - suf;
+	if (mid_old == mid_new) {
+		for (gint k = pre; k < pre + mid_old; k++) {
+			if (same_item(old, k, new, k)) {
+				replaced += sync_links(ours, k, new, k, depth);
+			} else {
+				replace_item(ours, k, new, k);
+				replaced++;
+			}
+		}
+	} else {
+		for (gint k = pre + mid_old - 1; k >= pre; k--)
+			p_g_menu_remove(ours, k);
+		for (gint k = 0; k < mid_new; k++) {
+			GMenuItem *item = p_g_menu_item_new_from_model(new, pre + k);
+			p_g_menu_insert_item(ours, pre + k, item);
+			p_g_object_unref(item);
+		}
+		replaced += mid_old > mid_new ? mid_old : mid_new;
+	}
+	return replaced;
+}
+
+/* Stand-ins in every other application window for action names new since the
+   last copy, each against that window's own menu widget. */
+static void add_stand_ins(struct record *rec, char **names, int n)
+{
+	for (GList *l = p_gtk_application_get_windows(rec->app); l != NULL;
+	     l = l->next) {
+		GtkWindow *window = l->data;
+		if (window == rec->window || !is_a(window, type_app_window))
+			continue;
+
+		struct look lk = {
+			.late = 0,
+			.ours = { (GMenuModel *)rec->container,
+				  (GMenuModel *)rec->inner },
+		};
+		GtkWidget *owner = NULL;
+		if (find_menu_model(window, &owner, &lk) == NULL)
+			continue;
+		for (int i = 0; i < n; i++)
+			if (!has_name(rec->names, rec->n_names, names[i]))
+				p_g_free(proxy_for(names[i], owner,
+						   (GActionMap *)window));
+	}
+}
+
+static gboolean rebuild_idle(gpointer data)
+{
+	struct record *rec = data;
+
+	rec->rebuild_idle = 0;
+	if (rec->state != OURS_FILLED || rec->source == NULL)
+		return FALSE;
+	if (rec->window == NULL || rec->owner == NULL) {
+		note("the menu's window or widget is gone; the menu is no longer followed");
+		stop_following(rec);
+		return FALSE;
+	}
+
+	GtkApplication *app = p_g_object_ref(rec->app);
+	struct scope scope = {
+		.owner = rec->owner,
+		.map = is_a(rec->window, type_app_window)
+			       ? (GActionMap *)rec->window
+			       : NULL,
+	};
+
+	unwatch(rec);
+	GMenuModel *copy = clean_model(rec->source, 0, &scope);
+	rec->syncing = 1;
+	int replaced = sync_menu(rec->inner, copy, 0);
+	rec->syncing = 0;
+	p_g_object_unref(copy);
+
+	char **names = NULL;
+	int n = 0;
+	collect_names(rec->source, 0, &names, &n);
+	add_stand_ins(rec, names, n);
+	free_names(rec->names, rec->n_names);
+	rec->names = names;
+	rec->n_names = n;
+
+	watch_model(rec, rec->source, 0);
+	rec->rebuilds++;
+	note("menu changed (rebuild %u): %d item(s) replaced", rec->rebuilds,
+	     replaced);
+	p_g_object_unref(app);
+	return FALSE;
+}
+
+static void on_source_changed(GMenuModel *model, gint position, gint removed,
+			      gint added, gpointer data)
+{
+	struct record *rec = data;
+
+	if (!rec->syncing && rec->rebuild_idle == 0)
+		rec->rebuild_idle = p_g_idle_add(rebuild_idle, rec);
+}
 
 static void release_menus(struct record *rec)
 {
@@ -1085,6 +1509,7 @@ static void record_free(gpointer data)
 {
 	struct record *rec = data;
 
+	stop_following(rec);
 	release_menus(rec);
 	free(rec);
 }
@@ -1188,6 +1613,7 @@ static void go_taken(struct record *rec)
 	note("the application set a menubar of its own; ours is released");
 	rec->state = TAKEN;
 	waiters_drop_record(rec);
+	stop_following(rec);
 	release_menus(rec);
 }
 
@@ -1246,6 +1672,7 @@ static int look(GtkWindow *window, struct record *rec, int late)
 		p_g_object_unref(item);
 	}
 	p_g_object_unref(cleaned);
+	start_following(rec, model, owner, window);
 
 	gchar *label = menu_label(app);
 	p_g_menu_append_submenu(rec->container, label, (GMenuModel *)rec->inner);
@@ -1449,6 +1876,8 @@ static void attach_menubar(GtkWindow *window)
 			return;
 		rec->container = p_g_menu_new();
 		rec->inner = p_g_menu_new();
+		p_g_object_set_data((GObject *)rec->inner, COPY_KEY,
+				    GINT_TO_POINTER(1));
 		p_gtk_application_set_menubar(app, (GMenuModel *)rec->container);
 		if (p_gtk_application_get_menubar(app) !=
 		    (GMenuModel *)rec->container) {

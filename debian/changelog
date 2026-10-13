@@ -1,3 +1,14 @@
+unity-gtk4-menu (0.13) resolute; urgency=medium
+
+  * Follow changes of the menu after it is exported: items-changed on the
+    menu and its sections and submenus schedules one rebuild per burst,
+    and the copy is edited in place, so only changed items are replaced
+    and an open panel menu keeps its groups (Nautilus relabels Undo after
+    a rename). Following stops when the window or widget the menu came
+    from is gone, or when the application sets a menubar of its own.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Tue, 13 Oct 2026 17:05:24 +0000
+
 unity-gtk4-menu (0.12) resolute; urgency=medium
 
   * Give a menu that appears after realize to the global menu: an empty

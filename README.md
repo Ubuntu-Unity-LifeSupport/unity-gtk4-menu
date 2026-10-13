@@ -102,8 +102,12 @@ exports the one that ranks first by:
    of those, secondary menus usually of actions scoped to one widget;
 4. tree order.
 
-The choice is made once, when the window is realized, and the copy does not
-follow later changes: an application that swaps its header bar when a
+The choice is made once, when the menu is first found. Later changes to that
+menu are followed: when the application adds, removes or relabels items (in the
+menu or in any of its sections and submenus), the exported copy is edited in
+place, and only the changed items reach the panel. An open panel menu stays
+open, except a submenu whose own item was relabelled. A different menu shown
+later is not followed: an application that swaps its header bar when a
 document opens (papers) keeps the menu it showed at start.
 
 ## Actions the window does not export
