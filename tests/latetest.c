@@ -128,18 +128,40 @@ static void subscribe(GtkWidget *window)
 	spin(300);
 }
 
-/* What the D-Bus client sees under the holder, after waiting up to 3 s. */
+/* What the D-Bus client sees under the holder, after waiting up to 3 s. The
+   holder's submenu proxy is kept while waiting: a GDBusMenuModel group is
+   subscribed while it has a reference, and dropping it at once would end the
+   subscription before the reply arrives. */
 static int client_items(void)
 {
 	if (client == NULL)
 		return -2;
-	for (int i = 0; i < 30; i++) {
-		int n = holder_items(client);
-		if (n > 0)
-			return n;
-		spin(100);
+	GMenuModel *sub = NULL;
+	int n = 0;
+	for (int i = 0; i < 30 && n <= 0; i++) {
+		if (sub == NULL && g_menu_model_get_n_items(client) > 0)
+			sub = g_menu_model_get_item_link(client, 0, "submenu");
+		if (sub != NULL)
+			n = g_menu_model_get_n_items(sub);
+		if (n <= 0)
+			spin(100);
 	}
-	return holder_items(client);
+	if (sub != NULL)
+		g_object_unref(sub);
+	return n;
+}
+
+/* Wait until WIDGET is mapped and the application's menubar has a filled
+   holder, up to 3 s each. The library fills the menubar from an idle after the
+   map, which runs after the next frame: under Xvfb a widget packed after
+   present maps up to 0.8 s later, or at once inside a frame that itself takes
+   0.3 s, so no fixed wait fits both. */
+static void wait_mapped(GtkWidget *widget)
+{
+	for (int i = 0; i < 150 && !gtk_widget_get_mapped(widget); i++)
+		spin(20);
+	for (int i = 0; i < 150 && holder_items(gtk_application_get_menubar(app)) <= 0; i++)
+		spin(20);
 }
 
 static int log_has(const char *text)
@@ -240,8 +262,8 @@ static void run_case(void)
 						  : menu_button(NULL);
 			gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(b), menu);
 			gtk_header_bar_pack_end(GTK_HEADER_BAR(header), b);
+			wait_mapped(b);
 		}
-		spin(500);
 		CHECK(holder_items(gtk_application_get_menubar(app)) > 0,
 		      "the late menu is not in the application's menubar");
 		CHECK(client_items() > 0,
@@ -256,9 +278,11 @@ static void run_case(void)
 		gtk_window_present(GTK_WINDOW(window));
 		spin(200);
 		subscribe(window);
-		gtk_header_bar_pack_start(GTK_HEADER_BAR(header),
-					  gtk_popover_menu_bar_new_from_model(menu));
-		spin(500);
+		{
+			GtkWidget *bar = gtk_popover_menu_bar_new_from_model(menu);
+			gtk_header_bar_pack_start(GTK_HEADER_BAR(header), bar);
+			wait_mapped(bar);
+		}
 		CHECK(holder_items(gtk_application_get_menubar(app)) > 0,
 		      "the late popover menu bar is not in the menubar");
 		CHECK(client_items() > 0,
