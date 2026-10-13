@@ -1097,8 +1097,20 @@ __attribute__((constructor)) static void shim_init(void)
  * unversioned symbol under any version asked.) The answer is still checked
  * against ourselves: the one that must never come back. Our issue #1; the
  * measurement is in unity-distro's docs/research/nocsd-order/.
+ *
+ * RTLD_NEXT only searches the global scope, and the library that owns the
+ * function may not be in it: Python opens its extension modules without
+ * RTLD_GLOBAL, so in a PyGObject process libgmodule is in _gi's local scope,
+ * while _gi's calls still bind to us, preloaded. RTLD_NEXT then finds
+ * nothing. Without gtk-nocsd after us to answer instead, every lookup failed
+ * and PyGObject stopped at its first import. So when RTLD_NEXT finds nothing,
+ * take the definition from its owner, OWNER, if that is already loaded -
+ * RTLD_NOLOAD never loads it into a process that has none. A handle's
+ * lookup searches the owner and its dependencies only, never the preloaded
+ * libraries, so it cannot come back with ours or gtk-nocsd's. The handle is
+ * kept: we keep calling the function. unity-distro UNITY-20261013-013.
  */
-static void *next_symbol(const char *name, void *self)
+static void *next_symbol(const char *name, void *self, const char *owner)
 {
 	static void *(*libc_dlsym)(void *, const char *);
 
@@ -1111,6 +1123,15 @@ static void *next_symbol(const char *name, void *self)
 
 	void *next = libc_dlsym != NULL ? libc_dlsym(RTLD_NEXT, name)
 					: dlsym(RTLD_NEXT, name);
+	if (next == NULL) {
+		void *lib = dlopen(owner, RTLD_LAZY | RTLD_NOLOAD);
+		if (lib != NULL)
+			next = libc_dlsym != NULL ? libc_dlsym(lib, name)
+						  : dlsym(lib, name);
+		if (next != NULL)
+			note("%s is not in the global scope; taking %s's own",
+			     name, owner);
+	}
 	if (next == self) {
 		note("the next %s is our own; not calling it", name);
 		return NULL;
@@ -1129,10 +1150,16 @@ gboolean g_module_symbol(GModule *module, const gchar *symbol_name,
 			 gpointer *symbol)
 {
 	static gboolean (*real)(GModule *, const gchar *, gpointer *);
+	static int missing;
 
 	if (real == NULL)
 		*(void **)(&real) = next_symbol("g_module_symbol",
-						  (void *)self_g_module_symbol);
+						  (void *)self_g_module_symbol,
+						  "libgmodule-2.0.so.0");
+	if (real == NULL && !missing) {
+		missing = 1;
+		note("no g_module_symbol to pass lookups on to");
+	}
 
 	gboolean found = real != NULL ? real(module, symbol_name, symbol) : FALSE;
 
@@ -1167,10 +1194,16 @@ void gtk_widget_action_set_enabled(GtkWidget *widget, const char *action_name,
 				   gboolean enabled)
 {
 	static void (*real)(GtkWidget *, const char *, gboolean);
+	static int missing;
 
 	if (real == NULL)
 		*(void **)(&real) = next_symbol("gtk_widget_action_set_enabled",
-						  (void *)self_action_set_enabled);
+						  (void *)self_action_set_enabled,
+						  "libgtk-4.so.1");
+	if (real == NULL && !missing) {
+		missing = 1;
+		note("no gtk_widget_action_set_enabled to call");
+	}
 	if (real != NULL)
 		real(widget, action_name, enabled);
 

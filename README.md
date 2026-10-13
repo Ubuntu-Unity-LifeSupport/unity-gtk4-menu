@@ -51,6 +51,12 @@ GTK4 at the first `gtk_` or `adw_` lookup. The lookup itself is passed on
 unchanged. gtk-nocsd, which Ubuntu Unity preloads as well, intercepts the same
 function; see the next section.
 
+The lookup is passed on to the next `g_module_symbol()` in load order, or,
+when that search finds none, to libgmodule's own. Python opens its extension
+modules without `RTLD_GLOBAL`, so in a PyGObject process libgmodule is not in
+the global scope; up to 0.10 the lookup then failed, and without gtk-nocsd
+preloaded (its opt-out) every PyGObject program stopped at its first import.
+
 ## Next to gtk-nocsd
 
 Ubuntu Unity's session preloads both libraries, this one first

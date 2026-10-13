@@ -1,3 +1,15 @@
+unity-gtk4-menu (0.11) resolute; urgency=medium
+
+  * Pass g_module_symbol() lookups on to libgmodule's own definition when
+    the next one in load order is not found. In a PyGObject process
+    libgmodule is not in the global scope, and with only this library
+    preloaded (the gtk-nocsd opt-out) every PyGObject program failed at
+    its first import. The same for gtk_widget_action_set_enabled() and
+    libgtk-4. Broken since 0.6.
+  * README: the lookup in PyGObject processes.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Tue, 13 Oct 2026 09:53:07 +0000
+
 unity-gtk4-menu (0.10) resolute; urgency=medium
 
   * Preload the library by path, /usr/$LIB/libunity-gtk4-menu.so.0, in
