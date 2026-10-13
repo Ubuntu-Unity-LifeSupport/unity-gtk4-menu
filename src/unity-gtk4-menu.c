@@ -1010,6 +1010,7 @@ static void proxy_item(GMenuModel *model, gint i, GMenuItem *item,
  * (sync_menu) can tell our menus from the application's.
  */
 #define COPY_KEY "unity-gtk4-menu-copy"
+#define MAX_DEPTH 16 /* the depth clean_model copies to */
 
 static int is_copy(GMenuModel *model)
 {
@@ -1045,7 +1046,7 @@ static GMenuModel *clean_model(GMenuModel *model, int depth,
 		proxy_item(model, i, item, scope);
 
 		const char *links[] = { "section", "submenu" };
-		for (int l = 0; l < 2 && depth < 16; l++) {
+		for (int l = 0; l < 2 && depth < MAX_DEPTH; l++) {
 			GMenuModel *child =
 				p_g_menu_model_get_item_link(model, i, links[l]);
 			if (child == NULL)
@@ -1119,14 +1120,14 @@ struct record {
 
 /*
  * After a fill the record keeps the source model and watches items-changed on
- * it and on every section and submenu reachable from it. A burst of changes
+ * it and on every section and submenu down to the depth clean_model copies
+ * (MAX_DEPTH); below it our copy links the application's own models, which
+ * the exporter watches itself. A burst of changes
  * schedules one idle, which copies the source again and syncs the copy into
  * inner in place (sync_menu), so the exporter sends Changed only for what
  * changed and an open panel menu keeps its groups. Our own menus are never
  * watched, and the application's are never edited.
  */
-#define MAX_DEPTH 16
-
 static void on_source_changed(GMenuModel *model, gint position, gint removed,
 			      gint added, gpointer data);
 
@@ -1140,7 +1141,7 @@ static int watched(struct record *rec, GMenuModel *model)
 
 static void watch_model(struct record *rec, GMenuModel *model, int depth)
 {
-	if (depth >= MAX_DEPTH || model == (GMenuModel *)rec->container ||
+	if (depth > MAX_DEPTH || model == (GMenuModel *)rec->container ||
 	    model == (GMenuModel *)rec->inner || watched(rec, model))
 		return;
 
@@ -1192,7 +1193,7 @@ static int has_name(char **names, int n, const char *name)
 
 static void collect_names(GMenuModel *model, int depth, char ***names, int *n)
 {
-	if (depth >= MAX_DEPTH)
+	if (depth > MAX_DEPTH)
 		return;
 
 	gint items = p_g_menu_model_get_n_items(model);
@@ -1378,7 +1379,7 @@ static int sync_menu(GMenu *ours, GMenuModel *new, int depth)
 	gint pre = 0, suf = 0;
 	int replaced = 0;
 
-	if (depth >= MAX_DEPTH)
+	if (depth > MAX_DEPTH)
 		return 0;
 
 	while (pre < min && same_item(old, pre, new, pre))
