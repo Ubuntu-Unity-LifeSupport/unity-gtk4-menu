@@ -1,9 +1,10 @@
 #!/usr/bin/python3
-"""latetest-adw.py CASE - the libadwaita cases of latetest (unity-gtk4-menu 0.11).
+"""latetest-adw.py CASE - the libadwaita cases of latetest (unity-gtk4-menu 0.12).
 
   6   while an AdwApplicationWindow waits for a menu, an AdwDialog with a menu
-      button is presented inside it, and a menu button inside a GtkPopover is
-      shown: neither becomes the application's menubar.
+      button in its own AdwHeaderBar is presented inside it, and a menu button
+      inside a GtkPopover is shown: each makes a late look, and neither becomes
+      the application's menubar.
   6a  Pinta's layout: an AdwApplicationWindow with an AdwToolbarView and an
       AdwHeaderBar in the content; the menu buttons are packed after present,
       libadwaita being loaded through GI after GTK. The main menu becomes the
@@ -47,6 +48,30 @@ def check_log(present, text):
         check(log_has(text) == present, f'log line "{text}" expected {"present" if present else "absent"}')
 
 
+def log_count(text):
+    path = os.environ.get('UNITY_GTK4_MENU_LOG')
+    try:
+        return 0 if path is None else open(path).read().count(text)
+    except OSError:
+        return 0
+
+
+def wait_log_count(text, n):
+    """Wait up to 3 s until TEXT is in the library's log at least N times."""
+    for _ in range(150):
+        if log_count(text) >= n:
+            return
+        spin(20)
+
+
+def wait_filled(app):
+    """Wait up to 3 s for a filled holder in the application's menubar."""
+    for _ in range(150):
+        if holder_items(app.get_menubar()) > 0:
+            return
+        spin(20)
+
+
 def spin(ms):
     end = GLib.get_monotonic_time() + ms * 1000
     ctx = GLib.MainContext.default()
@@ -75,6 +100,7 @@ def run(app):
         action = Gio.SimpleAction.new(name, None)
         app.add_action(action)
 
+    Gtk.Settings.get_default().set_property('gtk-shell-shows-menubar', True)  # as under Unity
     win = Adw.ApplicationWindow(application=app)
     view = Adw.ToolbarView()
     header = Adw.HeaderBar()
@@ -85,18 +111,45 @@ def run(app):
     spin(300)
 
     if case == '6':
+        # a realistic dialog: its menu button in its own AdwHeaderBar, so only the
+        # AdwDialog exclusion keeps it out (not the header-bar rule)
+        looks = log_count('late look')
         dialog = Adw.Dialog()
-        box = Gtk.Box()
-        box.append(Gtk.MenuButton(menu_model=menu('_Dialog', ['new', 'open'])))
-        dialog.set_child(box)
+        dview = Adw.ToolbarView()
+        dheader = Adw.HeaderBar()
+        dbutton = Gtk.MenuButton(menu_model=menu('_Dialog', ['new', 'open']))
+        dheader.pack_end(dbutton)
+        dview.add_top_bar(dheader)
+        dview.set_content(Gtk.Box())
+        dialog.set_child(dview)
         dialog.present(win)
-        spin(500)
+        for _ in range(150):
+            if dbutton.get_mapped():
+                break
+            spin(20)
+        if dbutton.get_root() is win:
+            # a sheet inside the window: the map makes a look, the AdwDialog exclusion rejects it
+            print(f'case {case}: the dialog is a sheet in the window', flush=True)
+            wait_log_count('late look', looks + 1)
+            spin(200)
+            if not control:
+                check(log_count('late look') > looks, "the dialog's menu button made no late look")
+        else:
+            # gtk-nocsd makes the dialog a window of its own: not the waiting window, no look
+            print(f'case {case}: the dialog is a window of its own ({type(dbutton.get_root()).__name__})', flush=True)
+            spin(500)
+            if not control:
+                check(log_count('late look') == looks, "a look ran for a dialog that is a window of its own")
         check(holder_items(app.get_menubar()) == 0, "a dialog's menu became the menubar")
         popover = Gtk.Popover()
         popover.set_child(Gtk.MenuButton(menu_model=menu('_Pop', ['quit'])))
         popover.set_parent(header)
+        looks = log_count('late look')
         popover.popup()
-        spin(500)
+        wait_log_count('late look', looks + 1)
+        spin(200)
+        if not control:
+            check(log_count('late look') > looks, "the popover's menu button made no late look")
         check(holder_items(app.get_menubar()) == 0, "a popover's menu became the menubar")
         check_log(True, 'the window waits for a menu')
         popover.unparent()
@@ -104,7 +157,7 @@ def run(app):
         # Pinta packs Effects, Adjustments and the main menu after present
         header.pack_end(Gtk.MenuButton(menu_model=menu('_Effects', ['about'])))
         header.pack_end(Gtk.MenuButton(menu_model=menu('_File', ['new', 'open', 'quit'])))
-        spin(600)
+        wait_filled(app)
         check(holder_items(app.get_menubar()) > 0, 'the late header-bar menu is not in the menubar')
         check_log(True, 'menubar filled late')
     app.quit()

@@ -172,7 +172,7 @@ DECL(GVariant *, g_variant_new_string, (const gchar *));
 DECL(void, g_menu_item_set_attribute_value,
      (GMenuItem *, const gchar *, GVariant *));
 
-/* menus that appear after realize (0.11) */
+/* menus that appear after realize (0.12) */
 DECL(gpointer, g_object_ref, (gpointer));
 DECL(void, g_object_set_data_full,
      (GObject *, const gchar *, gpointer, GDestroyNotify));

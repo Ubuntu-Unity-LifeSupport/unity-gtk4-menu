@@ -1,5 +1,5 @@
 /*
- * latetest - menus that appear after realize (unity-gtk4-menu 0.11).
+ * latetest - menus that appear after realize (unity-gtk4-menu 0.12).
  *
  * One case per process. Each case builds windows the way some application
  * does, runs the main loop briefly, and checks what the global menu would
@@ -7,7 +7,9 @@
  * the items a real D-Bus client (GDBusMenuModel, subscribed before the menu
  * appears) receives. With UNITY_GTK4_MENU_LOG set, it also checks the
  * library's own log lines; LATETEST_CONTROL=1 skips those, for a run against
- * a release that does not write them (the control run against 0.10).
+ * a release that does not write them (the control run against 0.11).
+ * gtk-shell-shows-menubar is TRUE, as under Unity; LATETEST_SHELL_MENUBAR=0
+ * sets it FALSE (run for cases 1 and 3).
  *
  * Not part of `make check`: it needs an X display, a D-Bus session and the
  * library preloaded. Run on a test machine, for example:
@@ -177,6 +179,21 @@ static int log_has(const char *text)
 	return found;
 }
 
+/* Wait up to 3 s for TEXT in the library's log, so that a case checks the path
+   it names before going on. Without a log (the control run) it just waits. */
+static void wait_log(const char *text)
+{
+	for (int i = 0; i < 150 && !log_has(text); i++)
+		spin(20);
+}
+
+/* Wait up to 3 s for a filled holder in the application's menubar. */
+static void wait_filled(void)
+{
+	for (int i = 0; i < 150 && holder_items(gtk_application_get_menubar(app)) <= 0; i++)
+		spin(20);
+}
+
 #define CHECK_LOG(present, text)                                               \
 	do {                                                                   \
 		if (!control)                                                  \
@@ -312,12 +329,16 @@ static void run_case(void)
 		{
 			GtkWidget *b = menu_button(NULL);
 			gtk_header_bar_pack_end(GTK_HEADER_BAR(header), b);
-			spin(300);
+			/* the map of the empty button makes a look that finds
+			   nothing; the model given after it must come through
+			   the per-instance notify, not through the map */
+			wait_log("late look: no menu yet");
+			CHECK_LOG(1, "late look: no menu yet");
 			CHECK(holder_items(gtk_application_get_menubar(app)) == 0,
 			      "items before the button has a menu");
 			gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(b), menu);
 		}
-		spin(500);
+		wait_filled();
 		CHECK(holder_items(gtk_application_get_menubar(app)) > 0,
 		      "the menu given later is not in the menubar");
 		CHECK_LOG(1, "menubar filled late");
@@ -383,13 +404,17 @@ static void run_case(void)
 		g_object_unref(item);
 		gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
 					menu_button(G_MENU_MODEL(custom)));
-		spin(300);
+		/* the first look must see the menu that cleans to nothing
+		   on its own, before the valid one exists */
+		wait_log("has no item that can cross D-Bus");
+		CHECK_LOG(1, "has no item that can cross D-Bus");
 		CHECK(holder_items(gtk_application_get_menubar(app)) == 0,
 		      "an empty cleaned menu was used");
 		gtk_header_bar_pack_start(GTK_HEADER_BAR(header), menu_button(menu));
-		spin(500);
+		wait_filled();
 		CHECK(holder_items(gtk_application_get_menubar(app)) > 0,
 		      "the valid menu after an empty one was not used");
+		CHECK_LOG(1, "menubar filled late");
 		g_object_unref(custom);
 		break;
 	}
@@ -422,6 +447,11 @@ static void on_activate(GApplication *a, gpointer d)
 	};
 	g_action_map_add_action_entries(G_ACTION_MAP(a), actions,
 					G_N_ELEMENTS(actions), NULL);
+	/* TRUE as under Unity; LATETEST_SHELL_MENUBAR=0 for the run without a
+	   shell menubar, where GTK puts an in-window bar on our menubar */
+	const char *shell = g_getenv("LATETEST_SHELL_MENUBAR");
+	g_object_set(gtk_settings_get_default(), "gtk-shell-shows-menubar",
+		     shell == NULL || strcmp(shell, "0") != 0, NULL);
 	g_application_hold(a);
 	run_case();
 	g_application_release(a);
