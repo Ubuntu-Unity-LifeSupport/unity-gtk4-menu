@@ -162,6 +162,7 @@ DECL(gboolean, gtk_widget_activate_action_variant,
 DECL(GSimpleAction *, g_simple_action_new, (const gchar *, const GVariantType *));
 DECL(void, g_action_map_add_action, (GActionMap *, GAction *));
 DECL(GAction *, g_action_map_lookup_action, (GActionMap *, const gchar *));
+DECL(void, g_action_map_remove_action, (GActionMap *, const gchar *));
 DECL(gulong, g_signal_connect_data,
      (gpointer, const gchar *, GCallback, gpointer, GClosureNotify,
       GConnectFlags));
@@ -290,6 +291,7 @@ static int resolve_all(void *gtk, void *gobj, void *glib, void *gio)
 	RESOLVE(gio, g_simple_action_new);
 	RESOLVE(gio, g_action_map_add_action);
 	RESOLVE(gio, g_action_map_lookup_action);
+	RESOLVE(gio, g_action_map_remove_action);
 	RESOLVE(gio, g_menu_item_set_attribute_value);
 	RESOLVE(gobj, g_signal_connect_data);
 	RESOLVE(gobj, g_object_add_weak_pointer);
@@ -436,6 +438,11 @@ struct look {
 	int late;
 	int in_titlebar;
 	GMenuModel *ours[2]; /* the container and the inner menu, or NULL */
+	/* A relook of a followed window (see "following the shown menu"):
+	   late's filter, except that @keep, the owner chosen at realize, is
+	   also taken where it is; no watch_late, since late stays 0. */
+	int relook;
+	GtkWidget *keep;
 };
 
 /* Adw types exist only once libadwaita has registered them, which in GI and
@@ -507,6 +514,10 @@ static void consider(struct candidates *out, GtkWidget *owner,
 		return;
 	if (lk->late && (!late_owner_ok(owner, lk) || !is_shown(owner) ||
 			 reachable_items(model, 0) == 0))
+		return;
+	if (lk->relook &&
+	    ((owner != lk->keep && !late_owner_ok(owner, lk)) ||
+	     !is_shown(owner) || reachable_items(model, 0) == 0))
 		return;
 	add_candidate(out, owner, model, primary, depth);
 }
@@ -599,7 +610,7 @@ static int reachable_items(GMenuModel *model, int depth)
    way the application's own popover resolves them, which is what activating
    a widget-scoped action needs. */
 static GMenuModel *find_menu_model(GtkWindow *window, GtkWidget **owner,
-				   struct look *lk)
+				   struct look *lk, struct candidate *chosen)
 {
 	struct candidates found = { .n = 0 };
 
@@ -630,6 +641,8 @@ static GMenuModel *find_menu_model(GtkWindow *window, GtkWidget **owner,
 	note("chose candidate %d of %d", best + 1, found.n);
 
 	*owner = found.c[best].owner;
+	if (chosen != NULL)
+		*chosen = found.c[best];
 	return found.c[best].model;
 }
 
@@ -722,8 +735,12 @@ static gchar *menu_label(GtkApplication *app)
 struct proxy {
 	GtkWidget *owner;  /* weak; the menu button, activation starts here */
 	GtkWidget *holder; /* weak; the widget whose class has the action */
+	GAction *action;   /* not a reference; the action this proxy serves */
 	gchar *name;
 };
+
+/* The struct proxy of a stand-in, kept on its action. */
+#define PROXY_DATA_KEY "unity-gtk4-menu-proxy-data"
 
 #define ENABLED_KEY "unity-gtk4-menu-enabled:"
 #define PROXY_KEY "unity-gtk4-menu-proxy:"
@@ -755,9 +772,13 @@ static void proxy_free(gpointer data, GClosure *closure)
 		p_g_object_remove_weak_pointer((GObject *)proxy->owner,
 					       (gpointer *)&proxy->owner);
 	if (proxy->holder != NULL) {
+		/* A stand-in that replaced this one (proxy_for) may already
+		   hold the key, if this action outlived its removal. */
 		char key[256];
 		make_key(key, sizeof key, PROXY_KEY, proxy->name);
-		p_g_object_set_data((GObject *)proxy->holder, key, NULL);
+		if (p_g_object_get_data((GObject *)proxy->holder, key) ==
+		    proxy->action)
+			p_g_object_set_data((GObject *)proxy->holder, key, NULL);
 		p_g_object_remove_weak_pointer((GObject *)proxy->holder,
 					       (gpointer *)&proxy->holder);
 	}
@@ -894,7 +915,22 @@ static gchar *proxy_for(const char *name, GtkWidget *owner, GActionMap *map)
 		if (*c == '.')
 			*c = '-';
 
-	if (p_g_action_map_lookup_action(map, local) == NULL) {
+	/* A stand-in left from another owner (the menu followed has changed,
+	   see "following the shown menu") is replaced, so activation and state
+	   come from the widgets shown now. */
+	GAction *existing = p_g_action_map_lookup_action(map, local);
+	if (existing != NULL) {
+		struct proxy *old =
+			p_g_object_get_data((GObject *)existing, PROXY_DATA_KEY);
+		if (old != NULL &&
+		    (old->owner != owner || old->holder != holder)) {
+			note("%s: stand-in moved to the menu shown now", name);
+			p_g_action_map_remove_action(map, local);
+			existing = NULL;
+		}
+	}
+
+	if (existing == NULL) {
 		struct proxy *proxy = calloc(1, sizeof *proxy);
 		proxy->owner = owner;
 		proxy->holder = holder;
@@ -954,6 +990,8 @@ static gchar *proxy_for(const char *name, GtkWidget *owner, GActionMap *map)
 
 		make_key(key, sizeof key, PROXY_KEY, name);
 		p_g_object_set_data((GObject *)holder, key, action);
+		proxy->action = (GAction *)action;
+		p_g_object_set_data((GObject *)action, PROXY_DATA_KEY, proxy);
 
 		p_g_action_map_add_action(map, (GAction *)action);
 		p_g_object_unref(action);
@@ -1102,9 +1140,13 @@ struct record {
 	GMenu *container;
 	GMenu *inner;
 	/* following the menu copied into inner, from the fill on */
-	GMenuModel *source;
-	GtkWidget *owner;   /* weak */
+	GMenuModel *source; /* NULL while orphaned */
+	GtkWidget *owner;   /* weak; NULL while orphaned */
 	GtkWindow *window;  /* weak */
+	GtkWidget *first_owner; /* weak; the owner chosen at the fill */
+	int primary, items; /* the source's rank: primary, app./win. items */
+	gulong owner_unmap, owner_destroy, window_destroy;
+	guint relook_idle;
 	struct watch *watches;
 	int n_watches, max_watches;
 	char **names;       /* the source's action names at the last copy */
@@ -1232,44 +1274,100 @@ static void free_names(char **names, int n)
 	free(names);
 }
 
-static void stop_following(struct record *rec)
+static void schedule_relook(struct record *rec);
+static void install_map_shims(void);
+
+/* Drops the source and its owner but keeps the window followed. A record
+   left so is orphaned: its owner went and no other menu was shown yet, the
+   copy stays as it is, and the next menu shown in the window is taken. */
+static void release_source(struct record *rec)
 {
 	if (rec->rebuild_idle != 0)
 		p_g_source_remove(rec->rebuild_idle);
 	rec->rebuild_idle = 0;
 	unwatch(rec);
-	free(rec->watches);
-	rec->watches = NULL;
-	rec->max_watches = 0;
-	if (rec->owner != NULL)
+	if (rec->owner != NULL) {
+		p_g_signal_handler_disconnect(rec->owner, rec->owner_unmap);
+		p_g_signal_handler_disconnect(rec->owner, rec->owner_destroy);
 		p_g_object_remove_weak_pointer((GObject *)rec->owner,
 					       (gpointer *)&rec->owner);
-	if (rec->window != NULL)
-		p_g_object_remove_weak_pointer((GObject *)rec->window,
-					       (gpointer *)&rec->window);
+	}
+	rec->owner_unmap = 0;
+	rec->owner_destroy = 0;
 	rec->owner = NULL;
-	rec->window = NULL;
 	if (rec->source != NULL)
 		p_g_object_unref(rec->source);
 	rec->source = NULL;
+}
+
+static void stop_following(struct record *rec)
+{
+	release_source(rec);
+	if (rec->relook_idle != 0)
+		p_g_source_remove(rec->relook_idle);
+	rec->relook_idle = 0;
+	free(rec->watches);
+	rec->watches = NULL;
+	rec->max_watches = 0;
+	if (rec->window != NULL) {
+		p_g_signal_handler_disconnect(rec->window, rec->window_destroy);
+		p_g_object_remove_weak_pointer((GObject *)rec->window,
+					       (gpointer *)&rec->window);
+	}
+	rec->window_destroy = 0;
+	rec->window = NULL;
+	if (rec->first_owner != NULL)
+		p_g_object_remove_weak_pointer((GObject *)rec->first_owner,
+					       (gpointer *)&rec->first_owner);
+	rec->first_owner = NULL;
 	free_names(rec->names, rec->n_names);
 	rec->names = NULL;
 	rec->n_names = 0;
 }
 
-static void start_following(struct record *rec, GMenuModel *source,
-			    GtkWidget *owner, GtkWindow *window)
+/* The owner hidden or destroyed: another menu may be shown now. */
+static void on_owner_gone(GtkWidget *owner, gpointer data)
 {
-	stop_following(rec);
+	schedule_relook(data);
+}
+
+static void on_followed_window_destroy(GtkWidget *window, gpointer data)
+{
+	note("the menu's window is gone; the menu is no longer followed");
+	stop_following(data);
+}
+
+static void set_source(struct record *rec, GMenuModel *source,
+		       GtkWidget *owner, const struct candidate *c)
+{
 	rec->source = p_g_object_ref(source);
 	rec->owner = owner;
+	p_g_object_add_weak_pointer((GObject *)owner, (gpointer *)&rec->owner);
+	rec->owner_unmap = p_g_signal_connect_data(
+		owner, "unmap", G_CALLBACK(on_owner_gone), rec, NULL, 0);
+	rec->owner_destroy = p_g_signal_connect_data(
+		owner, "destroy", G_CALLBACK(on_owner_gone), rec, NULL, 0);
+	rec->primary = c->primary;
+	rec->items = c->score;
+}
+
+static void start_following(struct record *rec, GMenuModel *source,
+			    GtkWidget *owner, GtkWindow *window,
+			    const struct candidate *c)
+{
+	stop_following(rec);
+	set_source(rec, source, owner, c);
 	rec->window = window;
-	if (owner != NULL)
-		p_g_object_add_weak_pointer((GObject *)owner,
-					    (gpointer *)&rec->owner);
 	p_g_object_add_weak_pointer((GObject *)window, (gpointer *)&rec->window);
+	rec->window_destroy = p_g_signal_connect_data(
+		window, "destroy", G_CALLBACK(on_followed_window_destroy), rec,
+		NULL, 0);
+	rec->first_owner = owner;
+	p_g_object_add_weak_pointer((GObject *)owner,
+				    (gpointer *)&rec->first_owner);
 	collect_names(source, 0, &rec->names, &rec->n_names);
 	watch_model(rec, source, 0);
+	install_map_shims();
 }
 
 /* Same attributes (names and values) and the same link names. */
@@ -1442,7 +1540,7 @@ static void add_stand_ins(struct record *rec, char **names, int n)
 				  (GMenuModel *)rec->inner },
 		};
 		GtkWidget *owner = NULL;
-		if (find_menu_model(window, &owner, &lk) == NULL)
+		if (find_menu_model(window, &owner, &lk, NULL) == NULL)
 			continue;
 		for (int i = 0; i < n; i++)
 			if (!has_name(rec->names, rec->n_names, names[i]))
@@ -1451,19 +1549,10 @@ static void add_stand_ins(struct record *rec, char **names, int n)
 	}
 }
 
-static gboolean rebuild_idle(gpointer data)
+/* Copies the source again and syncs the copy into inner in place. @what
+   names the change for the log: a rebuild, or a new source or owner. */
+static void rebuild_now(struct record *rec, const char *what)
 {
-	struct record *rec = data;
-
-	rec->rebuild_idle = 0;
-	if (rec->state != OURS_FILLED || rec->source == NULL)
-		return FALSE;
-	if (rec->window == NULL || rec->owner == NULL) {
-		note("the menu's window or widget is gone; the menu is no longer followed");
-		stop_following(rec);
-		return FALSE;
-	}
-
 	GtkApplication *app = p_g_object_ref(rec->app);
 	struct scope scope = {
 		.owner = rec->owner,
@@ -1486,12 +1575,39 @@ static gboolean rebuild_idle(gpointer data)
 	free_names(rec->names, rec->n_names);
 	rec->names = names;
 	rec->n_names = n;
+	rec->items = reachable_items(rec->source, 0);
 
 	watch_model(rec, rec->source, 0);
-	rec->rebuilds++;
-	note("menu changed (rebuild %u): %d item(s) replaced", rec->rebuilds,
-	     replaced);
+	if (what == NULL) {
+		rec->rebuilds++;
+		note("menu changed (rebuild %u): %d item(s) replaced",
+		     rec->rebuilds, replaced);
+	} else {
+		note("%s: %d item(s) replaced", what, replaced);
+	}
 	p_g_object_unref(app);
+}
+
+static gboolean rebuild_idle(gpointer data)
+{
+	struct record *rec = data;
+
+	rec->rebuild_idle = 0;
+	if (rec->state != OURS_FILLED || rec->source == NULL)
+		return FALSE;
+	if (rec->window == NULL) {
+		note("the menu's window is gone; the menu is no longer followed");
+		stop_following(rec);
+		return FALSE;
+	}
+	if (rec->owner == NULL) {
+		note("the menu's widget is gone; waiting for the next menu shown");
+		release_source(rec);
+		schedule_relook(rec);
+		return FALSE;
+	}
+
+	rebuild_now(rec, NULL);
 	return FALSE;
 }
 
@@ -1502,6 +1618,90 @@ static void on_source_changed(GMenuModel *model, gint position, gint removed,
 
 	if (!rec->syncing && rec->rebuild_idle == 0)
 		rec->rebuild_idle = p_g_idle_add(rebuild_idle, rec);
+}
+
+/* ---- following the shown menu ---------------------------------------------- */
+
+/*
+ * A window can show another main menu after the fill: papers hides its start
+ * page's menu and shows its sidebar's when a document opens. The followed
+ * window is looked at again (a relook) when a menu widget is mapped in it
+ * (the map shims below), and when the followed menu's owner is unmapped or
+ * destroyed. The candidates are those a late look accepts, plus the owner
+ * chosen at the fill wherever it is. R is the best of them by the realize
+ * ranking (all are shown, so primary, then items), C the menu followed now:
+ *  - C's owner gone: R is taken; with no R the record is orphaned (the copy
+ *    stays as it is) until a menu is shown in the window;
+ *  - C shown: R is taken if it ranks higher;
+ *  - C hidden and primary: R is taken if it is primary or has at least as
+ *    many items - papers' collapsed sidebar must not hand the panel its
+ *    document menu, whose items are mostly doc.* and out of reach;
+ *  - C hidden and not primary: R is taken;
+ *  - R the same model as C behind another owner, C's owner hidden or gone:
+ *    the owner is taken, and the stand-ins move to it.
+ * A switch syncs the copy in place, as a rebuild does; the holder stays.
+ */
+static void adopt(struct record *rec, GMenuModel *model, GtkWidget *owner,
+		  const struct candidate *c, const char *what)
+{
+	release_source(rec);
+	set_source(rec, model, owner, c);
+	rebuild_now(rec, what);
+}
+
+static gboolean relook_idle(gpointer data)
+{
+	struct record *rec = data;
+
+	rec->relook_idle = 0;
+	if (rec->state != OURS_FILLED)
+		return FALSE;
+	if (rec->window == NULL) {
+		stop_following(rec);
+		return FALSE;
+	}
+
+	GtkApplication *app = p_g_object_ref(rec->app);
+	struct look lk = {
+		.relook = 1,
+		.keep = rec->first_owner,
+		.ours = { (GMenuModel *)rec->container,
+			  (GMenuModel *)rec->inner },
+	};
+	struct candidate r;
+	GtkWidget *owner = NULL;
+
+	note("relook");
+	GMenuModel *model = find_menu_model(rec->window, &owner, &lk, &r);
+	int gone = rec->owner == NULL;
+	int shown = !gone && is_shown(rec->owner);
+
+	if (model == NULL) {
+		if (gone && rec->source != NULL) {
+			note("the menu's widget is gone and no other menu is shown; waiting");
+			release_source(rec);
+		}
+	} else if (model == rec->source) {
+		if (owner != rec->owner && !shown)
+			adopt(rec, model, owner, &r, "owner adopted");
+	} else if (gone ||
+		   (shown ? (r.primary && !rec->primary) ||
+				    (r.primary == rec->primary &&
+				     r.score > rec->items)
+			  : !rec->primary || r.primary ||
+				    r.score >= rec->items)) {
+		adopt(rec, model, owner, &r, "switched to the shown menu");
+	} else {
+		note("relook: the menu followed is kept");
+	}
+	p_g_object_unref(app);
+	return FALSE;
+}
+
+static void schedule_relook(struct record *rec)
+{
+	if (rec->relook_idle == 0 && rec->state == OURS_FILLED)
+		rec->relook_idle = p_g_idle_add(relook_idle, rec);
 }
 
 static void release_menus(struct record *rec)
@@ -1648,7 +1848,8 @@ static int look(GtkWindow *window, struct record *rec, int late)
 		.ours = { (GMenuModel *)rec->container, (GMenuModel *)rec->inner },
 	};
 	GtkWidget *owner = NULL;
-	GMenuModel *model = find_menu_model(window, &owner, &lk);
+	struct candidate chosen;
+	GMenuModel *model = find_menu_model(window, &owner, &lk, &chosen);
 
 	if (model == NULL) {
 		note(late ? "late look: no menu yet" : "no menu model in this window");
@@ -1681,7 +1882,7 @@ static int look(GtkWindow *window, struct record *rec, int late)
 		p_g_object_unref(item);
 	}
 	p_g_object_unref(cleaned);
-	start_following(rec, model, owner, window);
+	start_following(rec, model, owner, window, &chosen);
 
 	gchar *label = menu_label(app);
 	p_g_menu_append_submenu(rec->container, label, (GMenuModel *)rec->inner);
@@ -1749,8 +1950,8 @@ static void watch_late(GtkWidget *widget, const char *property,
 
 /*
  * The class map of GtkMenuButton and GtkPopoverMenuBar is replaced, as the
- * realize of the windows is, once the first window waits; while no window
- * waits the shim costs one integer test. Pinta packs its menu buttons into a
+ * realize of the windows is, once the first window waits or the first menu
+ * is followed; each map then costs a root and a record lookup. Pinta packs its menu buttons into a
  * header bar that is already mapped, which maps them on the spot with their
  * menu set. The class reference is taken then, not at load (GTK is up by then)
  * and never dropped. Subclasses whose class was initialised before and kept
@@ -1760,18 +1961,49 @@ static void watch_late(GtkWidget *widget, const char *property,
 static void (*real_menu_button_map)(GtkWidget *);
 static void (*real_menu_bar_map)(GtkWidget *);
 
+/* @widget is in @window's titlebar widget, whatever that widget is. */
+static int under_titlebar(GtkWidget *widget, GtkWindow *window)
+{
+	GtkWidget *bar = p_gtk_window_get_titlebar(window);
+
+	for (GtkWidget *w = widget; bar != NULL && w != NULL;
+	     w = p_gtk_widget_get_parent(w))
+		if (w == bar)
+			return 1;
+	return 0;
+}
+
 static void late_mapped(GtkWidget *widget)
 {
-	if (waiting_count == 0)
-		return;
-
 	GtkRoot *root = p_gtk_widget_get_root(widget);
 	if (root == NULL || p_gtk_widget_get_parent(widget) == (GtkWidget *)root)
 		return; /* the window's own in-window menubar */
 
-	struct waiter *w = waiter_find((GtkWindow *)root);
-	if (w != NULL)
-		schedule_look(w);
+	if (waiting_count > 0) {
+		struct waiter *w = waiter_find((GtkWindow *)root);
+		if (w != NULL) {
+			schedule_look(w);
+			return;
+		}
+	}
+
+	/* A menu widget mapped in a followed window may be another main
+	   menu shown; one filtered as a late look filters its owners, so list
+	   rows, dialogs and popovers do not cost a relook. */
+	if (!is_a(root, type_window))
+		return;
+	GtkApplication *app = p_gtk_window_get_application((GtkWindow *)root);
+	struct record *rec = app != NULL ? record_for(app) : NULL;
+	if (rec == NULL || rec->state != OURS_FILLED ||
+	    rec->window != (GtkWindow *)root || widget == rec->owner)
+		return;
+
+	struct look lk = {
+		.window = (GtkWindow *)root,
+		.in_titlebar = under_titlebar(widget, (GtkWindow *)root),
+	};
+	if (late_owner_ok(widget, &lk))
+		schedule_relook(rec);
 }
 
 static void shim_menu_button_map(GtkWidget *widget)
@@ -1921,7 +2153,7 @@ static void attach_menubar(GtkWindow *window)
 				  (GMenuModel *)rec->inner },
 		};
 		GtkWidget *owner = NULL;
-		GMenuModel *model = find_menu_model(window, &owner, &lk);
+		GMenuModel *model = find_menu_model(window, &owner, &lk, NULL);
 		if (model != NULL) {
 			struct scope scope = {
 				.owner = owner,
