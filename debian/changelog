@@ -1,3 +1,24 @@
+unity-gtk4-menu (0.14) resolute; urgency=medium
+
+  * Follow the menu the window shows, not only the one found first: a menu
+    button mapped in the followed window's header bar, or the followed
+    button hidden or destroyed, makes the library look again, and a shown
+    menu that ranks higher replaces the copy in place (papers' document
+    view shows its sidebar's main menu). A hidden primary menu gives way
+    only to a primary one or one with as many items; a destroyed one to
+    any; with nothing shown the window is still followed. Stand-ins move
+    to the widgets of the menu now shown.
+  * A rebuild that brings no new action looks at no other window
+    (relabels and toggles in an application with many windows).
+  * /etc/X11/Xsession.d/52unity-gtk4-menu: keep the library first in an X
+    session that exports an LD_PRELOAD of its own (~/.xsessionrc), which
+    95dbus_update-activation-env would otherwise put in place of the
+    user manager's value without it. It runs after 51gtk-nocsd and does
+    nothing without a session LD_PRELOAD, when the library is turned off,
+    or after the package is removed.
+
+ -- Ubuntu Unity Life Support <mihail.rozshko@gmail.com>  Sat, 17 Oct 2026 08:48:38 +0000
+
 unity-gtk4-menu (0.13) resolute; urgency=medium
 
   * Follow changes of the menu after it is exported: items-changed on the

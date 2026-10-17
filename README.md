@@ -33,8 +33,18 @@ In environment.d syntax the `$` is written `$$`. Programs that run with
 elevated privileges skip such an entry silently, so the library is installed
 with mode 0644.
 
+The user manager's value is replaced when an X session exports an `LD_PRELOAD`
+of its own (from `~/.xsessionrc`, say): `95dbus_update-activation-env` imports
+the session's value over it. So `/etc/X11/Xsession.d/52unity-gtk4-menu` puts
+the library back at the front of such a value, after `51gtk-nocsd` has added
+gtk-nocsd. It has to come first: with gtk-nocsd ahead of it, its
+`g_module_symbol()` (below) is never reached. A copy of the library preloaded
+from outside `/usr` (a build of one's own) is kept instead, if it exists. The
+script does nothing when the session has no `LD_PRELOAD`, when the library is
+turned off as below, or once the package is removed.
+
 To disable the library entirely, shadow its environment snippet with an empty
-file of the same name:
+file of the same name (the X session script honours it too):
 
     # everyone
     sudo touch /etc/environment.d/60-unity-gtk4-menu.conf
@@ -102,13 +112,18 @@ exports the one that ranks first by:
    of those, secondary menus usually of actions scoped to one widget;
 4. tree order.
 
-The choice is made once, when the menu is first found. Later changes to that
-menu are followed: when the application adds, removes or relabels items (in the
-menu or in any of its sections and submenus), the exported copy is edited in
-place, and only the changed items reach the panel. An open panel menu stays
-open, except a submenu whose own item was relabelled. A different menu shown
-later is not followed: an application that swaps its header bar when a
-document opens (papers) keeps the menu it showed at start.
+Changes to the menu are followed: when the application adds, removes or
+relabels items (in the menu or in any of its sections and submenus), the
+exported copy is edited in place, and only the changed items reach the panel.
+An open panel menu stays open, except a submenu whose own item was relabelled.
+
+A different menu shown later is followed too. When a menu button is mapped in
+the window's header bar, or the followed menu's button is hidden or destroyed,
+the window is looked at again, and a shown menu that ranks higher takes over:
+papers shows its sidebar's main menu once a document opens. A hidden primary
+menu is replaced only by another primary one or one with at least as many
+items, so a collapsed sidebar does not hand the panel a document menu made of
+actions it cannot reach. The copy is edited in place, as for a change.
 
 ## Actions the window does not export
 
