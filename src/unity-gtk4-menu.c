@@ -1422,6 +1422,14 @@ static int sync_menu(GMenu *ours, GMenuModel *new, int depth)
    last copy, each against that window's own menu widget. */
 static void add_stand_ins(struct record *rec, char **names, int n)
 {
+	/* Most changes relabel or toggle items, and bring no new action:
+	   then no other window is looked at. */
+	int fresh = 0;
+	for (int i = 0; i < n && !fresh; i++)
+		fresh = !has_name(rec->names, rec->n_names, names[i]);
+	if (!fresh)
+		return;
+
 	for (GList *l = p_gtk_application_get_windows(rec->app); l != NULL;
 	     l = l->next) {
 		GtkWindow *window = l->data;
