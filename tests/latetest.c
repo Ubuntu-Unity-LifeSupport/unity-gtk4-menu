@@ -16,7 +16,8 @@
  * library preloaded. Run on a test machine, for example:
  *
  *   cc -o latetest tests/latetest.c $(pkg-config --cflags --libs gtk4 x11)
- *   for c in 1 2 3 4 5 7 8 9 11 12 13 14 15 16 17 18 19 20 21 22; do
+ *   for c in 1 2 3 4 5 7 8 9 11 12 13 14 15 16 17 18 19 20 21 22 \
+ *            23 24 25 26 27 28 29 30 31 32 33 34 35; do
  *     dbus-run-session -- xvfb-run -a env G_DEBUG=fatal-criticals \
  *       UNITY_GTK4_MENU_FORCE=1 UNITY_GTK4_MENU_DEBUG=1 \
  *       UNITY_GTK4_MENU_LOG=/tmp/latetest-$c.log \
@@ -56,6 +57,24 @@
  *  21  a menu never changed; a rebuild of 200 items, timed
  *  22  a throwaway copy from a second window, then a rebuild and a new
  *      application menu (run under valgrind too)
+ * Following the shown menu (0.14):
+ *  23  a stack switch to a page with a larger primary menu, and back
+ *  24  the primary menu hidden while a small secondary one shows: kept
+ *  25  a primary overview menu over a non-primary main menu, and back
+ *  26  no primary anywhere: a page's larger menu while it shows, and back
+ *  27  the owner destroyed: (a) a smaller secondary menu taken, (b) nothing
+ *      shown, then a page added later, (c) the window closed
+ *  28  two instances of one class: the stand-in moves to the page shown,
+ *      also with the old stand-in outliving its removal
+ *  29  a realize-time popover menu bar in the content comes back
+ *  30  the same model behind a new owner: adopted, nothing on D-Bus
+ *  31  a crossfade: at most two relooks
+ *  32  list-row menu buttons mapped and unmapped: no relook
+ *  33  a rebuild pending at a switch; no relook after the application
+ *      takes the menubar
+ *  34  relabels look at no other window; a new action looks at each once
+ *  35  the window destroyed and the application quit with a relook pending
+ *      (run under valgrind too)
  * (6 and 6a, which need libadwaita, are in latetest-adw.py.)
  */
 #include <gtk/gtk.h>
@@ -519,6 +538,88 @@ static GType demo_box_type(void)
 	return type;
 }
 
+
+/* ---- following the shown menu (0.14) -------------------------------------- */
+
+/* A menu of N items "PREFIX-i" naming app.new, the kind a main menu is made
+   of; with GROUP_ITEMS more naming grp.x, an inserted group's kind. */
+static GMenuModel *menu_n(const char *prefix, int n, int group_items)
+{
+	GMenu *s = g_menu_new();
+	for (int i = 0; i < n; i++) {
+		char *l = g_strdup_printf("%s-%d", prefix, i);
+		g_menu_append(s, l, "app.new");
+		g_free(l);
+	}
+	for (int i = 0; i < group_items; i++)
+		g_menu_append(s, "Group item", "grp.x");
+	return G_MENU_MODEL(s);
+}
+
+/* A page as papers builds one: content with its own header bar holding a
+   menu button for MODEL. */
+static GtkWidget *page_with_menu(GMenuModel *model, gboolean primary,
+				 GtkWidget **button)
+{
+	GtkWidget *page = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+	GtkWidget *header = gtk_header_bar_new();
+	gtk_header_bar_set_show_title_buttons(GTK_HEADER_BAR(header), FALSE);
+	GtkWidget *b = menu_button(model);
+	gtk_menu_button_set_primary(GTK_MENU_BUTTON(b), primary);
+	gtk_header_bar_pack_end(GTK_HEADER_BAR(header), b);
+	gtk_box_append(GTK_BOX(page), header);
+	gtk_box_append(GTK_BOX(page), gtk_label_new("content"));
+	if (button != NULL)
+		*button = b;
+	return page;
+}
+
+/* An application window whose content is a stack of PAGES, the first shown. */
+static GtkWidget *stack_window(GtkWidget **stack, GtkWidget **pages, int n)
+{
+	GtkWidget *window = gtk_application_window_new(app);
+	gtk_window_set_default_size(GTK_WINDOW(window), 300, 200);
+	*stack = gtk_stack_new();
+	for (int i = 0; i < n; i++) {
+		char name[16];
+		snprintf(name, sizeof name, "p%d", i + 1);
+		gtk_stack_add_named(GTK_STACK(*stack), pages[i], name);
+	}
+	gtk_window_set_child(GTK_WINDOW(window), *stack);
+	return window;
+}
+
+static void show_page(GtkWidget *stack, const char *name)
+{
+	gtk_stack_set_visible_child_name(GTK_STACK(stack), name);
+}
+
+/* The first label of our copy, "" if none; g_free it. */
+static char *ours_first(void)
+{
+	GMenuModel *m = ours();
+	char *label = NULL;
+	if (m != NULL && g_menu_model_get_n_items(m) > 0)
+		g_menu_model_get_item_attribute(m, 0, "label", "s", &label);
+	return label != NULL ? label : g_strdup("");
+}
+
+#define CHECK_FIRST(want)                                                       \
+	do {                                                                    \
+		char *f_ = ours_first();                                        \
+		CHECK(strcmp(f_, (want)) == 0, "the copy starts with \"%s\", "  \
+		      "not \"%s\"", f_, (want));                                \
+		g_free(f_);                                                     \
+	} while (0)
+
+/* Wait for the Nth occurrence of TEXT in the library's log, then settle. */
+static void wait_log_n(const char *text, int n)
+{
+	for (int i = 0; i < 150 && log_count(text) < n; i++)
+		spin(20);
+	spin(200);
+}
+
 /* ---- the cases ------------------------------------------------------------ */
 
 /* A subclass of GtkMenuButton registered at run time, as GI and .NET
@@ -673,7 +774,9 @@ static void run_case(void)
 		spin(300);
 		CHECK(holder_items(gtk_application_get_menubar(app)) > 0,
 		      "the menu present at realize is not exported");
-		CHECK_LOG(0, "hooked GtkMenuButton::map");
+		/* 0.14 installs the map shims at the fill too, to follow the
+		   shown menu; the window still never waits */
+		CHECK_LOG(1, "hooked GtkMenuButton::map");
 		CHECK_LOG(0, "the window waits for a menu");
 		break;
 
@@ -1076,6 +1179,348 @@ static void run_case(void)
 		      "the application's menu carries the copy mark");
 		for (int i = 0; i < 32; i++)
 			g_object_unref(fresh[i]);
+		break;
+	}
+
+	case 23: { /* a stack switch: page 2's primary menu replaces page 1's */
+		GtkWidget *stack, *pages[2];
+		pages[0] = page_with_menu(menu_n("P1", 3, 0), TRUE, NULL);
+		pages[1] = page_with_menu(menu_n("P2", 5, 0), TRUE, NULL);
+		window = stack_window(&stack, pages, 2);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		CHECK_FIRST("P1-0");
+		watch_export(window);
+		g_free(export_dump(0)); /* subscribes every group, as the panel */
+		GMenuModel *inner = ours();
+		reset_changes();
+		show_page(stack, "p2");
+		wait_log_n("switched to the shown menu", 1);
+		CHECK_FIRST("P2-0");
+		CHECK(g_menu_model_get_n_items(ours()) == 5, "%d items, not 5",
+		      g_menu_model_get_n_items(ours()));
+		CHECK(ours() == inner, "the holder's submenu was replaced");
+		CHECK(g_menu_model_get_n_items(gtk_application_get_menubar(app)) == 1,
+		      "the menubar has %d holders",
+		      g_menu_model_get_n_items(gtk_application_get_menubar(app)));
+		CHECK(dbus_changes > 0, "no Changed on D-Bus");
+		CHECK(export_has("P2-4"), "the export lacks P2-4");
+		show_page(stack, "p1");
+		wait_log_n("switched to the shown menu", 2);
+		CHECK_FIRST("P1-0");
+		break;
+	}
+
+	case 24: { /* the primary menu hidden: a shown secondary one is not taken */
+		GtkWidget *b_main, *b_doc;
+		GtkWidget *page = page_with_menu(menu_n("Main", 5, 0), TRUE, &b_main);
+		GtkWidget *header = gtk_widget_get_first_child(page);
+		b_doc = menu_button(menu_n("Doc", 1, 10));
+		gtk_header_bar_pack_start(GTK_HEADER_BAR(header), b_doc);
+		window = gtk_application_window_new(app);
+		gtk_window_set_child(GTK_WINDOW(window), page);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		CHECK_FIRST("Main-0");
+		gtk_widget_set_visible(b_main, FALSE);
+		wait_log_n("relook", 1);
+		CHECK_LOG(1, "relook: the menu followed is kept");
+		CHECK_LOG(1, "shown=1 primary=0 app./win. items=1");
+		CHECK_FIRST("Main-0");
+		gtk_widget_set_visible(b_main, TRUE);
+		wait_log_n("relook", 2);
+		CHECK_LOG(0, "switched to the shown menu");
+		CHECK_FIRST("Main-0");
+		break;
+	}
+
+	case 25: { /* Console's shape: a primary overview menu, then back */
+		GtkWidget *stack, *pages[2];
+		pages[0] = page_with_menu(menu_n("Main", 6, 0), FALSE, NULL);
+		pages[1] = page_with_menu(menu_n("Overview", 3, 0), TRUE, NULL);
+		window = stack_window(&stack, pages, 2);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		CHECK_FIRST("Main-0");
+		show_page(stack, "p2");
+		wait_log_n("switched to the shown menu", 1);
+		CHECK_FIRST("Overview-0");
+		show_page(stack, "p1");
+		wait_log_n("switched to the shown menu", 2);
+		CHECK_FIRST("Main-0");
+		break;
+	}
+
+	case 26: { /* no primary anywhere: a page's larger menu while it shows */
+		GtkWidget *stack, *pages[2];
+		pages[0] = gtk_label_new("no menu here");
+		pages[1] = page_with_menu(menu_n("Page", 8, 0), FALSE, NULL);
+		window = stack_window(&stack, pages, 2);
+		header = gtk_header_bar_new();
+		gtk_header_bar_pack_end(GTK_HEADER_BAR(header),
+					menu_button(menu_n("Main", 6, 0)));
+		gtk_window_set_titlebar(GTK_WINDOW(window), header);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		CHECK_FIRST("Main-0");
+		show_page(stack, "p2");
+		wait_log_n("switched to the shown menu", 1);
+		CHECK_FIRST("Page-0");
+		show_page(stack, "p1");
+		wait_log_n("switched to the shown menu", 2);
+		CHECK_FIRST("Main-0");
+		break;
+	}
+
+	case 27: { /* the owner destroyed, not hidden */
+		GtkWidget *stack, *pages[2];
+		pages[0] = page_with_menu(menu_n("Gone", 3, 0), TRUE, NULL);
+		pages[1] = page_with_menu(menu_n("Small", 2, 0), FALSE, NULL);
+		window = stack_window(&stack, pages, 2);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		CHECK_FIRST("Gone-0");
+		/* (a) the current page destroyed, a smaller secondary menu shown */
+		gtk_stack_remove(GTK_STACK(stack), pages[0]);
+		show_page(stack, "p2");
+		wait_log_n("switched to the shown menu", 1);
+		CHECK_FIRST("Small-0");
+		/* (b) that page destroyed too, nothing else: orphaned, then a
+		   page added after the idle has run */
+		gtk_stack_remove(GTK_STACK(stack), pages[1]);
+		wait_log_n("no other menu is shown; waiting", 1);
+		CHECK_LOG(1, "no other menu is shown; waiting");
+		CHECK_FIRST("Small-0");
+		spin(500);
+		GtkWidget *fresh = page_with_menu(menu_n("Later", 4, 0), TRUE, NULL);
+		gtk_stack_add_named(GTK_STACK(stack), fresh, "p3");
+		show_page(stack, "p3");
+		wait_log_n("switched to the shown menu", 2);
+		CHECK_FIRST("Later-0");
+		/* (c) the window closed: no longer followed */
+		gtk_window_destroy(GTK_WINDOW(window));
+		spin(300);
+		CHECK_LOG(1, "the menu's window is gone; the menu is no longer followed");
+		break;
+	}
+
+	case 28: { /* two instances of one class: the stand-in moves with the menu */
+		GtkWidget *stack, *pages[2], *box[2];
+		for (int k = 0; k < 2; k++) {
+			GMenu *m = g_menu_new();
+			g_menu_append(m, k ? "Second" : "First", "app.new");
+			g_menu_append(m, "Act", "demo.act");
+			box[k] = g_object_new(demo_box_type(), NULL);
+			gtk_box_append(GTK_BOX(box[k]),
+				       page_with_menu(G_MENU_MODEL(m), TRUE, NULL));
+			pages[k] = box[k];
+		}
+		window = stack_window(&stack, pages, 2);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		const char *standin = "unity-gtk4-menu-demo-act";
+		GAction *old = g_action_map_lookup_action(G_ACTION_MAP(window), standin);
+		CHECK(old != NULL, "no stand-in after the fill");
+		if (old != NULL)
+			g_object_ref(old); /* outlives its removal */
+		show_page(stack, "p2");
+		wait_log_n("switched to the shown menu", 1);
+		CHECK_LOG(1, "stand-in moved to the menu shown now");
+		activated_on = NULL;
+		g_action_group_activate_action(G_ACTION_GROUP(window), standin, NULL);
+		spin(100);
+		CHECK(activated_on == box[1], "the stand-in activates %p, not page 2's %p",
+		      (void *)activated_on, (void *)box[1]);
+		GAction *now = g_action_map_lookup_action(G_ACTION_MAP(window), standin);
+		CHECK(now != NULL && now != old, "the stand-in was not replaced");
+		gtk_widget_action_set_enabled(box[1], "demo.act", FALSE);
+		spin(100);
+		CHECK(now != NULL && !g_action_get_enabled(now),
+		      "the new stand-in does not follow page 2's enabled state");
+		if (old != NULL)
+			g_object_unref(old); /* its proxy is freed only now */
+		spin(100);
+		gtk_widget_action_set_enabled(box[1], "demo.act", TRUE);
+		spin(100);
+		now = g_action_map_lookup_action(G_ACTION_MAP(window), standin);
+		CHECK(now != NULL && g_action_get_enabled(now),
+		      "the old stand-in's end cut the new one off");
+		break;
+	}
+
+	case 29: { /* a realize-time menu outside header bars comes back */
+		GtkWidget *content = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+		gtk_box_append(GTK_BOX(content),
+			       gtk_popover_menu_bar_new_from_model(menu_n("Bar", 3, 0)));
+		window = gtk_application_window_new(app);
+		gtk_window_set_child(GTK_WINDOW(window), content);
+		header = gtk_header_bar_new();
+		GtkWidget *b = menu_button(menu_n("Head", 3, 0));
+		gtk_menu_button_set_primary(GTK_MENU_BUTTON(b), TRUE);
+		gtk_widget_set_visible(b, FALSE);
+		gtk_header_bar_pack_end(GTK_HEADER_BAR(header), b);
+		gtk_window_set_titlebar(GTK_WINDOW(window), header);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		CHECK_FIRST("Bar-0");
+		gtk_widget_set_visible(b, TRUE);
+		wait_log_n("switched to the shown menu", 1);
+		CHECK_FIRST("Head-0");
+		gtk_widget_set_visible(b, FALSE);
+		wait_log_n("switched to the shown menu", 2);
+		CHECK_FIRST("Bar-0");
+		break;
+	}
+
+	case 30: { /* the same model behind a new owner */
+		GMenu *m = g_menu_new();
+		g_menu_append(m, "Same", "app.new");
+		g_menu_append(m, "Act", "demo.act");
+		window = gtk_application_window_new(app);
+		header = gtk_header_bar_new();
+		gtk_window_set_titlebar(GTK_WINDOW(window), header);
+		GtkWidget *box1 = g_object_new(demo_box_type(), NULL);
+		gtk_box_append(GTK_BOX(box1), menu_button(G_MENU_MODEL(m)));
+		gtk_header_bar_pack_end(GTK_HEADER_BAR(header), box1);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		watch_export(window);
+		g_free(export_dump(0)); /* subscribes every group, as the panel */
+		reset_changes();
+		gtk_header_bar_remove(GTK_HEADER_BAR(header), box1);
+		GtkWidget *box2 = g_object_new(demo_box_type(), NULL);
+		gtk_box_append(GTK_BOX(box2), menu_button(G_MENU_MODEL(m)));
+		gtk_header_bar_pack_end(GTK_HEADER_BAR(header), box2);
+		wait_log_n("owner adopted", 1);
+		CHECK_LOG(1, "owner adopted: 0 item(s) replaced");
+		CHECK(dbus_changes == 0, "%d Changed on D-Bus", dbus_changes);
+		activated_on = NULL;
+		g_action_group_activate_action(G_ACTION_GROUP(window),
+					       "unity-gtk4-menu-demo-act", NULL);
+		spin(100);
+		CHECK(activated_on == box2, "activation reached %p, not the new %p",
+		      (void *)activated_on, (void *)box2);
+		break;
+	}
+
+	case 31: { /* a crossfade: at most two relooks, page 2's menu at the end */
+		GtkWidget *stack, *pages[2];
+		pages[0] = page_with_menu(menu_n("P1", 3, 0), TRUE, NULL);
+		pages[1] = page_with_menu(menu_n("P2", 5, 0), TRUE, NULL);
+		window = stack_window(&stack, pages, 2);
+		gtk_stack_set_transition_type(GTK_STACK(stack),
+					      GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+		gtk_stack_set_transition_duration(GTK_STACK(stack), 200);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		show_page(stack, "p2");
+		spin(1000);
+		CHECK_FIRST("P2-0");
+		if (!control)
+			CHECK(log_count("] relook\n") >= 1 && log_count("] relook\n") <= 2,
+			      "%d relooks", log_count("] relook\n"));
+		break;
+	}
+
+	case 32: { /* list-row menu buttons mapped and unmapped: no relook */
+		GtkWidget *page = page_with_menu(menu_n("Main", 2, 0), TRUE, NULL);
+		GtkWidget *list = gtk_list_box_new();
+		for (int i = 0; i < 200; i++)
+			gtk_list_box_append(GTK_LIST_BOX(list),
+					    menu_button(menu_n("Row", 1, 0)));
+		gtk_box_append(GTK_BOX(page), list);
+		window = gtk_application_window_new(app);
+		gtk_window_set_child(GTK_WINDOW(window), page);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		for (int k = 0; k < 5; k++) {
+			gtk_widget_set_visible(list, FALSE);
+			spin(50);
+			gtk_widget_set_visible(list, TRUE);
+			spin(50);
+		}
+		spin(300);
+		CHECK_LOG(0, "] relook\n");
+		CHECK_FIRST("Main-0");
+		break;
+	}
+
+	case 33: { /* lifetime */
+		GtkWidget *stack, *pages[2];
+		/* a rebuild pending at a switch: cancelled, one sync */
+		GMenuModel *m1 = menu_n("P1", 3, 0);
+		pages[0] = page_with_menu(m1, TRUE, NULL);
+		pages[1] = page_with_menu(menu_n("P2", 5, 0), TRUE, NULL);
+		window = stack_window(&stack, pages, 2);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		show_page(stack, "p2"); /* unmaps page 1: the relook idle first */
+		relabel(G_MENU(m1), 0, "P1-changed", "app.new");
+		wait_log_n("switched to the shown menu", 1);
+		spin(300);
+		CHECK_LOG(0, "menu changed (rebuild 1)");
+		CHECK_FIRST("P2-0");
+		/* the application takes the menubar: no relook afterwards */
+		GMenuModel *own = main_menu();
+		gtk_application_set_menubar(app, own);
+		spin(200);
+		int relooks = log_count("] relook\n");
+		show_page(stack, "p1");
+		spin(500);
+		CHECK(log_count("] relook\n") == relooks, "a relook after TAKEN");
+		g_object_unref(own);
+		break;
+	}
+
+	case 35: { /* a window destroyed and the application quit with a relook pending */
+		GtkWidget *stack, *pages[2];
+		pages[0] = page_with_menu(menu_n("P1", 3, 0), TRUE, NULL);
+		pages[1] = page_with_menu(menu_n("P2", 5, 0), TRUE, NULL);
+		window = stack_window(&stack, pages, 2);
+		gtk_window_present(GTK_WINDOW(window));
+		wait_filled();
+		spin(300);
+		show_page(stack, "p2"); /* schedules a relook */
+		gtk_window_destroy(GTK_WINDOW(window));
+		break; /* the application quits in this turn */
+	}
+
+	case 34: { /* B: relabels look at no other window; a new action does */
+		GMenu *s = g_menu_new();
+		g_menu_append(s, "One", "app.new");
+		GMenu *top = g_menu_new();
+		g_menu_append_section(top, NULL, G_MENU_MODEL(s));
+		for (int k = 0; k < 10; k++)
+			filled_window(G_MENU_MODEL(top), NULL);
+		spin(300);
+		int looks = log_count("chose candidate");
+		for (int i = 0; i < 20; i++) {
+			char *l = g_strdup_printf("One %d", i);
+			relabel(s, 0, l, "app.new");
+			g_free(l);
+			wait_rebuild(i + 1);
+		}
+		if (!control)
+			CHECK(log_count("chose candidate") == looks,
+			      "%d window looks for 20 relabels",
+			      log_count("chose candidate") - looks);
+		g_menu_append(s, "Quit", "app.quit");
+		wait_rebuild(21);
+		if (!control)
+			CHECK(log_count("chose candidate") == looks + 9,
+			      "%d window looks for a new action, not 9",
+			      log_count("chose candidate") - looks);
 		break;
 	}
 	}
