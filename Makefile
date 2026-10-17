@@ -5,6 +5,8 @@ LIBDIR  ?= $(PREFIX)/lib
 DATADIR ?= $(PREFIX)/share
 # systemd reads /usr/lib/environment.d, which is not multiarch - unlike LIBDIR.
 ENVDIR  ?= $(PREFIX)/lib/environment.d
+# Xsession(5) sources its snippets from here; not under PREFIX.
+XSESSIONDIR ?= /etc/X11/Xsession.d
 
 SONAME  = libunity-gtk4-menu.so.0
 TARGET  = $(SONAME)
@@ -31,6 +33,8 @@ install: check
 	install -m 644 $(TARGET) $(DESTDIR)$(LIBDIR)/$(SONAME)
 	install -d $(DESTDIR)$(ENVDIR)
 	install -m 644 data/60-unity-gtk4-menu.conf $(DESTDIR)$(ENVDIR)/
+	install -d $(DESTDIR)$(XSESSIONDIR)
+	install -m 644 data/52unity-gtk4-menu $(DESTDIR)$(XSESSIONDIR)/
 	install -d $(DESTDIR)$(DATADIR)/glib-2.0/schemas
 	install -m 644 data/com.ubuntu-unity.gtk4-menu.gschema.xml \
 	        $(DESTDIR)$(DATADIR)/glib-2.0/schemas/

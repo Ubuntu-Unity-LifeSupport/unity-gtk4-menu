@@ -32,6 +32,7 @@ Description: Export GTK4 header bar menus to the Unity global menu
  itself. It does nothing outside a Unity session.
  .
  This package includes an environment variable snippet to load the library for
- all user processes. To disable it, create an empty file
+ all user processes, and an X session script that keeps it first in a session
+ that sets an LD_PRELOAD of its own. To disable both, create an empty file
  /etc/environment.d/60-unity-gtk4-menu.conf for everyone, or
  ~/.config/environment.d/60-unity-gtk4-menu.conf for one user.

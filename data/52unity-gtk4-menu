@@ -1,0 +1,67 @@
+# This file is sourced by Xsession(5) and by lightdm-session, not executed.
+#
+# unity-gtk4-menu sets LD_PRELOAD in /usr/lib/environment.d, which only the
+# systemd user manager reads. 95dbus_update-activation-env later exports the
+# session's own LD_PRELOAD to the user manager, replacing the value it built
+# there, so when the session has one (~/.xsessionrc) the library is lost from
+# everything the session starts. Put it back in front, where environment.d
+# puts it: with gtk-nocsd ahead of it, our g_module_symbol is never reached,
+# so an entry of ours found behind it is moved to the front too.
+#
+# Runs after 51gtk-nocsd, which starts from the user manager's value only when
+# the session has no LD_PRELOAD of its own and then already carries ours.
+
+if [ -r /usr/lib/environment.d/60-unity-gtk4-menu.conf ] &&
+    [ -n "${LD_PRELOAD-}" ]; then
+  # Turned off by the user or the administrator: an
+  # environment.d/60-unity-gtk4-menu.conf of their own, in any directory
+  # systemd reads before /usr/lib, shadows ours. The list is left as it is.
+  _ugm_off=
+  for _ugm_e in /etc /run /usr/local/lib \
+      "${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}"; do
+    if [ -e "$_ugm_e/environment.d/60-unity-gtk4-menu.conf" ]; then
+      _ugm_off=1
+    fi
+  done
+
+  if [ -z "$_ugm_off" ]; then
+    # Every other entry in its order, ours (wherever 51gtk-nocsd or the
+    # user left it) taken out and put first, once. The installed library, by
+    # bare name or any path under /usr, becomes the path form; a copy of
+    # ours preloaded from elsewhere (a build of one's own) is kept instead,
+    # as long as it exists.
+    _ugm_new=
+    _ugm_own=
+    _ugm_rest=$(printf '%s\n' "$LD_PRELOAD" | tr ' \t\n' ':::')
+    while [ -n "$_ugm_rest" ]; do
+      case $_ugm_rest in
+        *:*) _ugm_e=${_ugm_rest%%:*}; _ugm_rest=${_ugm_rest#*:} ;;
+        *)   _ugm_e=$_ugm_rest; _ugm_rest= ;;
+      esac
+      case $_ugm_e in
+        ''|libunity-gtk4-menu.so.0|/usr/*/libunity-gtk4-menu.so.0) ;;
+        */libunity-gtk4-menu.so.0)
+          if [ -z "$_ugm_own" ] && [ -e "$_ugm_e" ]; then
+            _ugm_own=$_ugm_e
+          fi
+          ;;
+        *) _ugm_new=${_ugm_new:+$_ugm_new:}$_ugm_e ;;
+      esac
+    done
+    _ugm_new=${_ugm_own:-'/usr/$LIB/libunity-gtk4-menu.so.0'}${_ugm_new:+:$_ugm_new}
+
+    if [ "$_ugm_new" != "$LD_PRELOAD" ]; then
+      _ugm_old=$LD_PRELOAD
+      LD_PRELOAD=$_ugm_new
+      export LD_PRELOAD
+      # 51gtk-nocsd passes its value inside a setgid ssh-agent as the first
+      # words of STARTUP; an outer env of ours would be overridden by it.
+      case $STARTUP in
+        "env LD_PRELOAD=$_ugm_old "*)
+          STARTUP="env LD_PRELOAD=$LD_PRELOAD ${STARTUP#"env LD_PRELOAD=$_ugm_old "}"
+          ;;
+      esac
+    fi
+  fi
+  unset _ugm_off _ugm_new _ugm_own _ugm_old _ugm_rest _ugm_e
+fi
